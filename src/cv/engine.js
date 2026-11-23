@@ -9,6 +9,13 @@ import { similarity, thresholdFor, confidentPairs } from './match.js';
 
 export const MAX_SHOWN = 3;
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+// Light hysteresis only: brief misses shouldn't flicker, but a wrong lock must not stick.
+const TRACK_HOLD_MS = 700;
+const TRACK_HOLD_MISSES = 10;
+const MATCH_HOLD_MS = 400;
+const MATCH_HOLD_MISSES = 5;
+const DROP_SLACK = 0.08; // acquire at thr, drop a little below it
+const MISS_EMA_DECAY = 0.90;
 
 export function createEngine() {
   const seg = createSegmenter();
@@ -63,20 +70,54 @@ export function createEngine() {
     return t.refS;
   }
 
+  function iou(a, b) {
+    const x0 = Math.max(a[0], b[0]), y0 = Math.max(a[1], b[1]);
+    const x1 = Math.min(a[2], b[2]), y1 = Math.min(a[3], b[3]);
+    const iw = Math.max(0, x1 - x0), ih = Math.max(0, y1 - y0);
+    const inter = iw * ih;
+    if (!inter) return 0;
+    const uni = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter;
+    return uni > 0 ? inter / uni : 0;
+  }
+
+  function isSticky(id) {
+    const ms = matchState.get(id);
+    if (ms && ms.shown) return true;
+    for (const st of pairState.values()) {
+      if (st.shown && (st.a === id || st.b === id)) return true;
+    }
+    return false;
+  }
+
+  function holdExpired(st) {
+    return (st.missed || 0) >= MATCH_HOLD_MISSES && (lastT - (st.lastHit || 0) >= MATCH_HOLD_MS);
+  }
+
   function associate(regions, dt) {
     const diag = Math.hypot(W, H);
-    const gate = diag * 0.09 + Math.hypot(gvx, gvy) * dt * 0.5;
     const cands = [];
     for (const r of regions) {
+      const rbox = [r.minX, r.minY, r.maxX, r.maxY];
       for (const t of tracks.values()) {
-        const px = t.cx + gvx * dt, py = t.cy + gvy * dt;
+        const vx = t.vx || 0, vy = t.vy || 0;
+        const px = t.cx + vx * dt, py = t.cy + vy * dt;
+        const pbox = t.box
+          ? [t.box[0] + vx * dt, t.box[1] + vy * dt, t.box[2] + vx * dt, t.box[3] + vy * dt]
+          : null;
+        const ov = pbox ? iou(rbox, pbox) : 0;
         const d = Math.hypot(r.cx - px, r.cy - py);
-        if (d > gate) continue;
-        const ar = Math.abs(Math.log(r.area / t.area));
-        if (ar > 1.0) continue;
+        const established = (t.hits || 0) >= 3 || isSticky(t.id);
+        const gate = diag * (established ? 0.14 : 0.09) + Math.hypot(vx, vy) * dt * 0.8 + (established ? 12 : 0);
+        if (d > gate && ov < 0.15) continue;
+        const ar = Math.abs(Math.log(r.area / Math.max(1, t.area)));
+        if (ar > 1.2) continue;
         const dc = Math.hypot((r.mL - t.mL) * 0.5, r.mA - t.mA, r.mB - t.mB);
-        if (dc > 22) continue;
-        cands.push({ r, t, cost: d / gate + dc / 25 + ar * 0.6, dx: r.cx - t.cx, dy: r.cy - t.cy });
+        const colorGate = established ? 30 : 22;
+        if (dc > colorGate && ov < 0.25) continue;
+        let cost = (1 - ov) * 0.9 + d / Math.max(gate, 1) * 0.7 + dc / 30 + ar * 0.5;
+        if (established) cost -= 0.08;
+        if (isSticky(t.id)) cost -= 0.12;
+        cands.push({ r, t, cost, dx: r.cx - t.cx, dy: r.cy - t.cy });
       }
     }
     cands.sort((a, b) => a.cost - b.cost);
@@ -159,11 +200,12 @@ export function createEngine() {
         tr.mL = r.mL; tr.mA = r.mA; tr.mB = r.mB;
         tr.box = [r.minX, r.minY, r.maxX, r.maxY];
         tr.edge = r.touchesEdge;
+        tr.lastSeen = t;
       } else {
         tr = {
           id: nextId++, cx: r.cx, cy: r.cy, vx: gvx, vy: gvy, area: r.area,
           outline: r.outline, desc: describeRegion(r, planes, w, h, s.regionMap, refL),
-          descFrame: frameNo, descArea: r.area, dv: 1, hits: 1, missed: 0,
+          descFrame: frameNo, descArea: r.area, dv: 1, hits: 1, missed: 0, lastSeen: t,
           mL: r.mL, mA: r.mA, mB: r.mB, box: [r.minX, r.minY, r.maxX, r.maxY], edge: r.touchesEdge,
         };
         described++;
@@ -176,15 +218,22 @@ export function createEngine() {
       if (seen.has(tr.id)) continue;
       tr.region = null;
       tr.missed++;
-      tr.cx += gvx * dt; tr.cy += gvy * dt;
-      tr.vx = gvx; tr.vy = gvy;
-      const offscreen = tr.cx < -10 || tr.cy < -10 || tr.cx > w + 10 || tr.cy > h + 10;
-      if (tr.missed > 6 || offscreen) tracks.delete(tr.id);
+      // Coast with last velocity, easing toward camera motion — don't snap to zero.
+      tr.vx = (tr.vx || 0) * 0.85 + gvx * 0.15;
+      tr.vy = (tr.vy || 0) * 0.85 + gvy * 0.15;
+      const dx = tr.vx * dt, dy = tr.vy * dt;
+      tr.cx += dx; tr.cy += dy;
+      if (tr.box) tr.box = [tr.box[0] + dx, tr.box[1] + dy, tr.box[2] + dx, tr.box[3] + dy];
+      const farOff = tr.cx < -40 || tr.cy < -40 || tr.cx > w + 40 || tr.cy > h + 40;
+      const age = t - (tr.lastSeen || 0);
+      if (farOff && tr.missed > 6) tracks.delete(tr.id);
+      else if (tr.missed > TRACK_HOLD_MISSES || age > TRACK_HOLD_MS) tracks.delete(tr.id);
     }
     const t2 = now();
 
-    // Taps / scans set the reference sock.
+    // Taps / scans / an ML mask set the reference sock.
     let scan = null;
+    if (o.refMask) scan = refFromMask(o.refMask, o.excludeId);
     if (o.tap) scan = refFromTap(o.tap);
     if (o.scanBox) scan = refFromBox(o.scanBox, refL);
 
@@ -196,8 +245,16 @@ export function createEngine() {
     const medA = areas.length ? areas[areas.length >> 1] : 0;
     const minA = Math.max(n * 0.003, medA * 0.3);
     const y0 = (o.roi?.y0 ?? 0), y1 = (o.roi?.y1 ?? h);
-    const live = [...tracks.values()].filter((x) => x.hits >= minHits && x.missed <= 4
-      && x.area >= minA && x.cy >= y0 && x.cy <= y1 && !x.edge);
+    const live = [...tracks.values()].filter((x) => {
+      const sticky = isSticky(x.id);
+      // Only currently-detected socks are scored; coasting tracks keep a
+      // shown lock via match/pair hold, without refreshing lastHit.
+      if (x.missed > 0) return false;
+      if (x.hits < minHits && !sticky) return false;
+      if (x.area < minA && !sticky) return false;
+      if (!sticky && (x.cy < y0 || x.cy > y1 || x.edge)) return false;
+      return true;
+    });
     let pairs = [], matches = [];
     if ((o.mode || 'scan') === 'pairs') pairs = updatePairs(live, thr, !!o.still);
     else if (ref) matches = updateMatches(live, thr, !!o.still);
@@ -209,8 +266,9 @@ export function createEngine() {
     if (ref && ref.excludeId) show.add(ref.excludeId);
     const outTracks = [];
     for (const tr of tracks.values()) {
-      const o2 = { id: tr.id, cx: tr.cx, cy: tr.cy, vx: tr.vx, vy: tr.vy, area: tr.area, missed: tr.missed, hits: tr.hits };
-      if (show.has(tr.id)) o2.outline = Array.from(tr.outline);
+      const o2 = { id: tr.id, cx: tr.cx, cy: tr.cy, vx: tr.vx, vy: tr.vy, area: tr.area, missed: tr.missed, hits: tr.hits, box: tr.box, dv: tr.dv };
+      if ((show.has(tr.id) || tr.missed === 0) && tr.outline) o2.outline = Array.from(tr.outline);
+      if (ref && tr.id !== ref.excludeId) o2.colorScore = refSim(tr);
       outTracks.push(o2);
     }
     return {
@@ -226,6 +284,27 @@ export function createEngine() {
     ref = { desc, excludeId };
     refVersion++;
     matchState = new Map();
+  }
+
+  /** Build a reference descriptor from a binary mask (row-major, 1 = sock). */
+  function refFromMask(mask, excludeId) {
+    if (!mask || mask.length !== W * H) return { ok: false };
+    const px = [];
+    for (let i = 0; i < mask.length; i++) if (mask[i]) px.push(i);
+    if (px.length < Math.max(24, (W * H) * 0.001)) return { ok: false };
+    const r = regionLike(px);
+    const map = new Int32Array(W * H).fill(-1);
+    for (const i of px) map[i] = 0;
+    const refL = lastSeg?.surface?.L ?? 70;
+    const desc = describeRegion(r, planes, W, H, map, refL);
+    let ex = excludeId || 0;
+    if (!ex) {
+      for (const tr of tracks.values()) {
+        if (tr.cx >= r.minX && tr.cx <= r.maxX && tr.cy >= r.minY && tr.cy <= r.maxY && tr.area > px.length * 0.3) ex = tr.id;
+      }
+    }
+    setRef(desc, ex);
+    return { ok: true, method: 'mask', box: [r.minX, r.minY, r.maxX, r.maxY], id: ex };
   }
 
   function refFromTap(p) {
@@ -357,15 +436,24 @@ export function createEngine() {
       const key = `${p.a}:${p.b}`;
       foundKeys.add(key);
       let st = pairState.get(key);
-      if (!st) { st = { a: p.a, b: p.b, ema: still ? p.score : p.score * 0.7, shown: false, slot: 0, count: still ? 9 : 0 }; pairState.set(key, st); }
-      else st.ema = st.ema * 0.6 + p.score * 0.4;
+      if (!st) {
+        st = { a: p.a, b: p.b, ema: still ? p.score : p.score * 0.7, shown: false, slot: 0, count: still ? 9 : 0, missed: 0, lastHit: lastT };
+        pairState.set(key, st);
+      } else st.ema = st.ema * 0.6 + p.score * 0.4;
       st.count++;
       st.score = p.score;
+      const seenNow = still || ((tracks.get(p.a)?.missed || 0) === 0 && (tracks.get(p.b)?.missed || 0) === 0);
+      if (seenNow && p.score >= thr - DROP_SLACK) { st.missed = 0; st.lastHit = lastT; }
+      else st.missed = (st.missed || 0) + 1;
     }
     for (const [key, st] of pairState) {
-      if (!foundKeys.has(key)) st.ema *= 0.82;
+      if (!foundKeys.has(key)) {
+        st.ema *= still ? 0.82 : MISS_EMA_DECAY;
+        st.missed = (st.missed || 0) + 1;
+      }
       const gone = !tracks.has(st.a) || !tracks.has(st.b);
-      if (gone || st.ema < thr * 0.6) pairState.delete(key);
+      if (still && (gone || st.ema < thr * 0.6)) pairState.delete(key);
+      else if (holdExpired(st) && (gone || st.ema < thr * 0.45)) pairState.delete(key);
     }
     return selectShown([...pairState.values()], thr, (st) => [st.a, st.b], alive, 0, 3);
   }
@@ -381,14 +469,24 @@ export function createEngine() {
     const topIds = new Set(top.map((f) => f.id));
     for (const f of top) {
       let st = matchState.get(f.id);
-      if (!st) { st = { id: f.id, ema: still ? f.s : f.s * 0.75, shown: false, slot: 0, count: still ? 9 : 0 }; matchState.set(f.id, st); }
-      else st.ema = st.ema * 0.6 + f.s * 0.4;
+      if (!st) {
+        st = { id: f.id, ema: still ? f.s : f.s * 0.75, shown: false, slot: 0, count: still ? 9 : 0, missed: 0, lastHit: lastT };
+        matchState.set(f.id, st);
+      } else st.ema = st.ema * 0.6 + f.s * 0.4;
       st.count++;
       st.score = f.s;
+      const seenNow = still || (tracks.get(f.id)?.missed || 0) === 0;
+      if (seenNow && f.s >= thr - DROP_SLACK) { st.missed = 0; st.lastHit = lastT; }
+      else st.missed = (st.missed || 0) + 1;
     }
     for (const [id, st] of matchState) {
-      if (!topIds.has(id)) st.ema *= 0.85;
-      if (!tracks.has(id) || st.ema < thr * 0.6) matchState.delete(id);
+      if (!topIds.has(id)) {
+        st.ema *= still ? 0.85 : MISS_EMA_DECAY;
+        st.missed = (st.missed || 0) + 1;
+      }
+      const gone = !tracks.has(id);
+      if (still && (gone || st.ema < thr * 0.6)) matchState.delete(id);
+      else if (holdExpired(st) && (gone || st.ema < thr * 0.45)) matchState.delete(id);
     }
     const alive = new Set(live.map((t) => t.id));
     const states = [...matchState.values()];
@@ -397,12 +495,17 @@ export function createEngine() {
       .map((st) => ({ id: st.id, score: st.ema, slot: st.slot }));
   }
 
-  /** Hysteresis + max-3 selection with stable slots. */
+  /** Hysteresis + max-3 selection with stable slots. Drop bar is lower than acquire, and a shown lock is held ~2s through misses. */
   function selectShown(states, thr, members, alive, floor = 0, minCount = 1) {
-    const on = Math.max(thr, floor), off = thr - 0.06;
+    const on = Math.max(thr, floor), off = thr - DROP_SLACK;
     for (const st of states) {
       const ok = members(st).every((id) => tracks.has(id));
-      if (st.shown && (st.ema < off || !ok)) { st.shown = false; st.slot = 0; }
+      if (!st.shown) continue;
+      // Still/photo frames are a fresh snapshot; live camera holds through brief misses.
+      if (st.ema < off || !ok) {
+        if (!holdExpired(st) && lastT) continue;
+        st.shown = false; st.slot = 0;
+      }
     }
     const shown = states.filter((s) => s.shown).sort((a, b) => b.ema - a.ema);
     const used = new Set();
@@ -446,5 +549,5 @@ export function createEngine() {
     return a && b ? sim(a, b) : 0;
   }
 
-  return { process, reset, clearRef, allPairs, simBetween, getTracks: () => tracks, hasRef: () => !!ref };
+  return { process, reset, clearRef, allPairs, simBetween, getTracks: () => tracks, hasRef: () => !!ref, setRefFromMask: (mask, excludeId) => refFromMask(mask, excludeId) };
 }

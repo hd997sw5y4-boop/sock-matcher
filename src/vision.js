@@ -47,11 +47,17 @@ export function createVision(onResult) {
    * Draw `source` region (sx,sy,sw,sh) into a w x h buffer and process it.
    * Returns the frame sequence number, or 0 if a frame is already in flight.
    */
-  function submit(source, rect, w, h, opts) {
-    if (busy) return 0;
+  function snapshot(source, rect, w, h) {
+    if (!source || !rect || !w || !h) return null;
     if (grab.width !== w || grab.height !== h) { grab.width = w; grab.height = h; }
     gctx.drawImage(source, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, w, h);
-    const img = gctx.getImageData(0, 0, w, h);
+    return gctx.getImageData(0, 0, w, h);
+  }
+
+  function submit(source, rect, w, h, opts) {
+    if (busy) return 0;
+    const img = snapshot(source, rect, w, h);
+    if (!img) return 0;
     busy = true;
     const s = ++seq;
     if (worker) {
@@ -78,18 +84,27 @@ export function createVision(onResult) {
     });
   }
 
-  function ask(msg) {
+  function ask(msg, transfer) {
     if (!worker) {
-      return ensureInline().then((eng) => (msg.type === 'allPairs' ? eng.allPairs(msg.strictness) : eng.simBetween(msg.a, msg.b)));
+      return ensureInline().then((eng) => {
+        if (msg.type === 'allPairs') return eng.allPairs(msg.strictness);
+        if (msg.type === 'setRefMask') return eng.setRefFromMask(msg.mask ? new Uint8Array(msg.mask) : null, msg.excludeId);
+        return eng.simBetween(msg.a, msg.b);
+      });
     }
     const id = ++replyId;
-    return new Promise((resolve) => { replies.set(id, resolve); worker.postMessage({ ...msg, id }); });
+    return new Promise((resolve) => {
+      replies.set(id, resolve);
+      worker.postMessage({ ...msg, id }, transfer || []);
+    });
   }
 
   return {
     submit,
+    snapshot,
     reset: (hard = false, clearRef = false) => post({ type: 'reset', hard, clearRef }),
     clearRef: () => post({ type: 'clearRef' }),
+    setRefMask: (mask, excludeId) => ask({ type: 'setRefMask', mask, excludeId }),
     allPairs: (strictness) => ask({ type: 'allPairs', strictness }),
     sim: (a, b) => ask({ type: 'sim', a, b }),
     isBusy: () => busy,

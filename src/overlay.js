@@ -47,7 +47,8 @@ export function createOverlay(canvas) {
     if (extra?.target) { drawTarget(extra.target, now); drewLast = true; }
     const ease = 1 - Math.exp(-dt / 55);
     for (const it of [...items.values()]) {
-      it.alpha += (it.dying ? -1 : 1) * dt / 160;
+      // Fade in quickly; short fade-out once a lock is actually dropped.
+      it.alpha += (it.dying ? -1 : 1) * dt / (it.dying ? 280 : 160);
       if (it.alpha <= 0 && it.dying) { items.delete(it.key); continue; }
       it.alpha = Math.min(1, Math.max(0, it.alpha));
       const tr = it.track;

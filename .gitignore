@@ -5,3 +5,4 @@ blob-report/
 .vercel/
 .DS_Store
 .vercel
+.cache/

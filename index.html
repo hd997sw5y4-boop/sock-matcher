@@ -8,7 +8,7 @@
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Sock Match" />
-  <meta name="description" content="Point your camera at a pile of socks and find the pairs. Works entirely on your phone — no account, no AI, no server." />
+  <meta name="description" content="Point your camera at a pile of socks and find the pairs. Works entirely on your phone — no account, no server. A small pattern model downloads once and stays on the device." />
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="apple-touch-icon" href="/icons/icon-192.png" />
   <link rel="icon" type="image/png" sizes="32x32" href="/icons/icon-32.png" />
@@ -37,6 +37,10 @@
     </header>
 
     <div id="status-chip" hidden></div>
+    <div id="model-progress" hidden>
+      <div class="mp-bar"><i id="model-progress-bar"></i></div>
+      <span id="model-progress-label">Loading pattern model…</span>
+    </div>
 
     <div id="gate">
       <div class="gate-card">
@@ -44,8 +48,8 @@
           <i class="s s1"></i><i class="s s2"></i><i class="s s3"></i>
         </div>
         <h1>Find the pairs.</h1>
-        <p>Scan one sock, then point at the pile. Its match lights up live.</p>
-        <p class="tip">Tip: spread socks out a little so they don’t overlap.</p>
+        <p>Tap a sock, or put one in the box and scan it. The live camera then lights up its best 1–3 matches — only when it’s sure.</p>
+        <p class="tip">Tip: spread the pile a little if you can. The first visit downloads a small on-phone pattern model.</p>
         <button id="btn-camera" class="primary" type="button">Enable Camera</button>
         <div class="gate-row">
           <button id="btn-demo-gate" class="secondary" type="button">Try Demo Pile</button>

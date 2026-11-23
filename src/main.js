@@ -2,6 +2,7 @@ import { createVision } from './vision.js';
 import { createCamera } from './camera.js';
 import { generateDemoPile } from './demo.js';
 import { createOverlay, SLOT_COLORS, MATCH_COLOR } from './overlay.js';
+import { createMlClient } from './ml/client.js';
 
 const $ = (id) => document.getElementById(id);
 const video = $('video');
@@ -20,6 +21,10 @@ const DEBUG = new URLSearchParams(location.search).has('debug');
 const camera = createCamera(video);
 const overlay = createOverlay(overlayCanvas);
 const vision = createVision(onResult);
+const ml = createMlClient();
+const params = new URLSearchParams(location.search);
+const DEMO_MODE = params.has('demo');
+const USE_ML = !DEMO_MODE && !params.has('noml');
 
 const CAMERA_PIXELS = 90_000; // vision buffer size (about 210x430 on a phone)
 const STILL_PIXELS = 140_000;
@@ -41,6 +46,7 @@ const state = {
   resultMap: null,
   resultRect: null,
   hasRef: false,
+  mlResult: null,
   lastSubmit: 0,
   stillDirty: false,
   demoTruth: null,
@@ -183,36 +189,64 @@ function onResult(res) {
   perf.visionTimes.push(performance.now());
   if (perf.visionTimes.length > 30) perf.visionTimes.shift();
   if (res.scan) onScanResult(res, lay);
-  state.hasRef = !!res.ref;
+  state.hasRef = !!res.ref || state.hasRef;
   updateTargets(res);
   updateUi();
+  maybeScore(res);
   if (state.stillDirty && state.still) { state.stillDirty = false; submit(performance.now()); }
   const waiters = state.waiters.splice(0);
   for (const fn of waiters) fn(res);
 }
 
+function displayLists(res) {
+  const mlOn = USE_ML && ml.isReady();
+  if (state.mode === 'scan') {
+    if (mlOn && state.hasRef) return { matches: state.mlResult?.matches || [], pairs: [] };
+    if (mlOn && !state.hasRef) return { matches: [], pairs: [] };
+    return { matches: res.matches || [], pairs: [] };
+  }
+  if (mlOn) return { matches: [], pairs: state.mlResult?.pairs || [] };
+  return { matches: [], pairs: res.pairs || [] };
+}
+
 function updateTargets(res) {
+  if (!res) return;
   const byId = new Map(res.tracks.map((t) => [t.id, t]));
+  const lists = displayLists(res);
   const targets = [];
   if (state.mode === 'scan') {
-    for (const m of res.matches) {
+    for (const m of lists.matches) {
       const t = byId.get(m.id);
-      if (!t || !t.outline) continue;
+      if (!t) continue;
+      // Fresh scores may land before the next vision outline is attached.
+      if (!t.outline && t.box) t.outline = boxOutline(t.box);
+      if (!t.outline) continue;
       targets.push({ key: `m${m.id}`, track: t, color: MATCH_COLOR, kind: 'match', label: `${Math.round(m.score * 100)}%` });
     }
     const refT = res.ref?.excludeId && byId.get(res.ref.excludeId);
     if (refT && refT.outline) targets.push({ key: `r${refT.id}`, track: refT, kind: 'ref', color: '#ffffff' });
   } else {
-    for (const p of res.pairs) {
+    for (const p of lists.pairs) {
       const color = SLOT_COLORS[(p.slot - 1) % SLOT_COLORS.length];
       for (const id of [p.a, p.b]) {
         const t = byId.get(id);
-        if (!t || !t.outline) continue;
+        if (!t) continue;
+        if (!t.outline && t.box) t.outline = boxOutline(t.box);
+        if (!t.outline) continue;
         targets.push({ key: `p${p.a}-${p.b}-${id}`, track: t, color, kind: 'pair', label: String(p.slot) });
       }
     }
   }
   overlay.setTargets(targets, performance.now());
+}
+
+function boxOutline(box) {
+  const [x0, y0, x1, y1] = box;
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  return [
+    x0 - cx, y0 - cy, x1 - cx, y0 - cy,
+    x1 - cx, y1 - cy, x0 - cx, y1 - cy,
+  ];
 }
 
 function onScanResult(res, lay) {
@@ -244,14 +278,19 @@ function updateUi() {
   if (state.mode === 'scan') {
     shutter.querySelector('.shutter-label').textContent = state.hasRef ? 'Rescan' : 'Scan';
     shutter.classList.remove('on');
-    if (!state.hasRef) setChip(state.still ? 'Tap a sock or Scan the one in the box' : 'Scan one sock to find its match');
-    else if (res && res.matches.length) setChip(`Best match ${Math.round(res.matches[0].score * 100)}%`);
-    else setChip('Looking for its match…');
+    if (!state.hasRef) setChip(state.still ? 'Tap a sock or Scan the one in the box' : 'Tap a sock, or Scan the one in the box');
+    else {
+      const lists = res ? displayLists(res) : { matches: [] };
+      if (lists.matches.length) setChip(`Best match ${Math.round(lists.matches[0].score * 100)}%`);
+      else if (USE_ML && !ml.isReady()) setChip('Loading pattern model…');
+      else setChip('Looking for its match…');
+    }
   } else {
     shutter.querySelector('.shutter-label').textContent = state.frozen ? 'Resume' : 'Freeze';
     shutter.classList.toggle('on', state.frozen);
-    const n = res ? res.pairs.length : 0;
-    setChip(`${state.frozen ? 'Frozen · ' : ''}${n ? `${n} likely pair${n === 1 ? '' : 's'}` : 'Looking for pairs…'}`);
+    const n = res ? displayLists(res).pairs.length : 0;
+    const waiting = USE_ML && !ml.isReady();
+    setChip(`${state.frozen ? 'Frozen · ' : ''}${n ? `${n} likely pair${n === 1 ? '' : 's'}` : (waiting ? 'Loading pattern model…' : 'Looking for pairs…')}`);
   }
   refCard.hidden = !state.hasRef;
 }
@@ -305,7 +344,8 @@ function resetVision(clearRef = false) {
   vision.reset(!!state.still, clearRef);
   overlay.clearAll();
   state.result = null;
-  if (clearRef) { state.hasRef = false; refCard.hidden = true; }
+  state.mlResult = null;
+  if (clearRef) { state.hasRef = false; refCard.hidden = true; ml.clearRef(); }
 }
 
 function reprocessStill() {
@@ -320,6 +360,7 @@ async function startCamera() {
     state.demoTruth = null;
     frame.classList.remove('show');
     resetVision(true);
+    startMl();
     await camera.start('environment');
     video.classList.toggle('mirror', camera.isFront());
     syncTorch();
@@ -334,6 +375,7 @@ async function startCamera() {
 }
 
 function useStill(canvas, source, truth = null) {
+  if (source === 'photo') startMl();
   camera.stop();
   syncTorch();
   state.still = canvas;
@@ -404,20 +446,119 @@ function setMode(mode, keepRef = false) {
   reprocessStill();
 }
 
-function doScan() {
+function workSnapshot(lay) {
+  const src = currentSource();
+  if (!src || !lay) return null;
+  return vision.snapshot(src, lay.rect, lay.w, lay.h);
+}
+
+function paintThumb(box, lay) {
+  const src = currentSource();
+  if (!src || !box || !lay) return;
+  const [x0, y0, x1, y1] = box;
+  const fx = lay.rect.sw / lay.w, fy = lay.rect.sh / lay.h;
+  const pad = 3;
+  let sx = lay.rect.sx + (x0 - pad) * fx, sy = lay.rect.sy + (y0 - pad) * fy;
+  let sw = (x1 - x0 + 2 * pad) * fx, sh = (y1 - y0 + 2 * pad) * fy;
+  const side = Math.max(sw, sh);
+  sx -= (side - sw) / 2; sy -= (side - sh) / 2;
+  const tctx = refThumb.getContext('2d');
+  tctx.fillStyle = '#222';
+  tctx.fillRect(0, 0, refThumb.width, refThumb.height);
+  try { tctx.drawImage(src, sx, sy, side, side, 0, 0, refThumb.width, refThumb.height); } catch { /* ignore */ }
+}
+
+async function applyPick(pick, lay) {
+  if (!pick?.ok || !pick.mask) return false;
+  const applied = await vision.setRefMask(pick.mask);
+  if (applied && applied.ok === false) return false;
+  if (pick.embedding) await ml.setRefEmbedding(pick.embedding);
+  state.hasRef = true;
+  state.mlResult = null;
+  paintThumb(pick.box, lay);
+  refCard.hidden = false;
+  if (state.mode !== 'scan') setMode('scan', true);
+  toast('Scanned — now point at the pile');
+  updateUi();
+  reprocessStill();
+  return true;
+}
+
+function startMl() {
+  if (!USE_ML) return;
+  ml.start();
+}
+
+ml.onChange((s) => {
+  const el = $('model-progress');
+  if (!el) return;
+  if (s.status === 'loading') {
+    el.hidden = false;
+    const bar = $('model-progress-bar');
+    const label = $('model-progress-label');
+    if (bar) bar.style.width = `${Math.max(2, s.progress || 0)}%`;
+    if (label) label.textContent = (s.progress || 0) < 62 ? 'Loading pattern model…' : 'Loading sock cutter…';
+  } else if (s.status === 'ready') {
+    el.hidden = true;
+    if (!el.dataset.readyToast) {
+      el.dataset.readyToast = '1';
+      toast('Pattern matching ready — tap a sock');
+    }
+    if (state.result) maybeScore(state.result);
+    updateUi();
+  } else if (s.status === 'error') {
+    el.hidden = true;
+    toast('Pattern model couldn’t load — check the network and try again');
+    updateUi();
+  }
+});
+
+async function maybeScore(res) {
+  if (!USE_ML || !ml.isReady() || !res) return;
+  if (state.mode === 'scan' && !state.hasRef) return;
+  const lay = state.resultLayout;
+  const img = workSnapshot(lay);
+  if (!img) return;
+  const tracks = (res.tracks || []).filter((t) => t.box && (t.missed || 0) === 0);
+  const out = await ml.score(img.data, img.width, img.height, tracks, {
+    mode: state.mode,
+    now: performance.now(),
+  });
+  if (!out) return;
+  state.mlResult = out;
+  updateTargets(state.result);
+  updateUi();
+}
+
+async function doScan() {
   const lay = state.resultLayout || layoutFor(currentSource() || video);
   if (!lay) { toast('Start the camera first'); return; }
   const b = targetBox();
   const [x0, y0] = lay.map.toWork(b.x, b.y);
   const [x1, y1] = lay.map.toWork(b.x + b.w, b.y + b.h);
-  state.pending.scanBox = { x0: Math.min(x0, x1), y0, x1: Math.max(x0, x1), y1 };
+  const box = { x0: Math.min(x0, x1), y0, x1: Math.max(x0, x1), y1 };
   if (state.frozen) setFrozen(false);
+  if (USE_ML && ml.isReady()) {
+    const img = workSnapshot(lay);
+    if (img) {
+      toast('Picking the sock…');
+      const pick = await ml.pick(img.data, img.width, img.height, { x: (box.x0 + box.x1) / 2, y: (box.y0 + box.y1) / 2 }, box);
+      if (await applyPick(pick, lay)) return;
+      toast('Couldn’t find a sock there — try tapping it');
+      return;
+    }
+  } else if (USE_ML && !ml.isReady()) {
+    toast('Still loading the pattern model…');
+  }
+  state.pending.scanBox = box;
   reprocessStill();
 }
 
 function clearRef() {
   vision.clearRef();
+  ml.clearRef();
   state.hasRef = false;
+  state.mlResult = null;
   refCard.hidden = true;
   overlay.setTargets([], performance.now());
   updateUi();
@@ -438,6 +579,16 @@ function onTap(ev) {
     toast('Surface locked');
     reprocessStill();
     return;
+  }
+  if (USE_ML && ml.isReady()) {
+    const img = workSnapshot(lay);
+    if (img) {
+      toast('Picking the sock…');
+      ml.pick(img.data, img.width, img.height, { x: wx, y: wy }).then(async (pick) => {
+        if (!(await applyPick(pick, lay))) toast('Couldn’t find a sock there — try again');
+      });
+      return;
+    }
   }
   state.pending.tap = { x: wx, y: wy };
   reprocessStill();
@@ -541,6 +692,8 @@ function exposeDebug() {
         overlayItems: overlay.count(),
         timing: r ? r.timing : null,
         perf: perfSummary(),
+        ml: { ...ml.getState(), result: state.mlResult },
+        displayed: r ? displayLists(r) : null,
       };
     },
     loadDemo,

@@ -22,6 +22,10 @@ self.onmessage = (e) => {
       self.postMessage({ type: 'reply', id: m.id, value: engine.allPairs(m.strictness) });
     } else if (m.type === 'sim') {
       self.postMessage({ type: 'reply', id: m.id, value: engine.simBetween(m.a, m.b) });
+    } else if (m.type === 'setRefMask') {
+      const mask = m.mask ? new Uint8Array(m.mask) : null;
+      const value = engine.setRefFromMask(mask, m.excludeId);
+      self.postMessage({ type: 'reply', id: m.id, value });
     }
   } catch (err) {
     self.postMessage({ type: 'error', message: String(err && err.stack || err), seq: m.seq });
