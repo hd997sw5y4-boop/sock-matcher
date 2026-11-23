@@ -400,7 +400,7 @@ export function createSegmenter() {
     // Paint a region-id map (for the descriptor's interior test and hit tests).
     sub.fill(-1);
     for (const r of keep) for (let k = 0; k < r.pixels.length; k++) sub[r.pixels[k]] = r.id;
-    return { regions: keep, surface, regionMap: sub, w, h };
+    return { regions: keep, surface, regionMap: sub, w, h, fg };
   }
 
   return { segment, surfaceAt: (i) => ({ L: bgL[i], a: bgA[i], b: bgB[i] }) };

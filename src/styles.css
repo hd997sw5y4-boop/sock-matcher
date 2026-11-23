@@ -550,3 +550,61 @@ input[type="range"] {
   flex: none;
   accent-color: #2f6fed;
 }
+
+#app.mode-colors { --dock-h: calc(176px + var(--safe-b)); }
+#app.mode-colors #btn-shutter { display: none; }
+
+#color-chips {
+  display: flex;
+  gap: 8px;
+  width: min(420px, 100%);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 2px 2px 4px;
+  scrollbar-width: none;
+  mask-image: linear-gradient(to right, transparent, #000 8px, #000 calc(100% - 8px), transparent);
+}
+#color-chips::-webkit-scrollbar { display: none; }
+#color-chips[hidden] { display: none; }
+
+.color-chip {
+  flex: none;
+  width: 46px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  color: #ececec;
+}
+.color-chip .swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255,255,255,0.45);
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.35);
+  background: var(--swatch, #ccc);
+}
+.color-chip[data-id="multi"] .swatch {
+  background: conic-gradient(#f4a4c0, #3b82f6, #34d399, #f5d76e, #ef4444, #a78bfa, #f4a4c0);
+}
+.color-chip[data-id="pick"] .swatch {
+  background:
+    radial-gradient(circle at 50% 50%, transparent 0 6px, #fff 7px 8px, transparent 9px),
+    linear-gradient(135deg, #111 40%, #64d2ff 40% 60%, #111 60%);
+  background-color: #1c1c1e;
+}
+.color-chip .chip-label {
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  white-space: nowrap;
+}
+.color-chip.active .swatch {
+  box-shadow: 0 0 0 2px #fff, 0 0 0 4px rgba(255,255,255,0.35);
+}
+.color-chip.active .chip-label { color: #fff; }
+
+.pills { gap: 0; }
+#app.mode-colors .pill,
+#mode-toggle .pill { font-size: 13px; }

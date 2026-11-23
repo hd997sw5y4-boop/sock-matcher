@@ -6,6 +6,7 @@ import { rgbaToLabPlanes, blur3 } from './lab.js';
 import { createSegmenter } from './segment.js';
 import { describeRegion } from './describe.js';
 import { similarity, thresholdFor, confidentPairs } from './match.js';
+import { collectColorHits, pickColorAt } from './colorClass.js';
 
 export const MAX_SHOWN = 3;
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
@@ -161,6 +162,19 @@ export function createEngine() {
     const s = seg.segment(planes, w, h, { sensitivity: o.sensitivity ?? 0.5, surface });
     lastSeg = s;
     const t1 = now();
+    if ((o.mode || 'scan') === 'colors') {
+      frameNo++;
+      const colorHits = collectColorHits(planes, s, o.colorQuery || { id: 'pink' }, { roi: o.roi });
+      const colorPick = o.colorTap ? pickColorAt(o.colorTap.x, o.colorTap.y, planes, s, w, h) : null;
+      return {
+        w, h, frame: frameNo,
+        tracks: [], pairs: [], matches: [], scan: null,
+        ref: ref ? { excludeId: ref.excludeId || 0 } : null,
+        colorHits, colorPick,
+        regions: s.regions.length,
+        timing: { seg: t1 - t0, track: 0, match: 0, total: now() - t0, described: 0 },
+      };
+    }
     for (const r of s.regions) quickMean(r);
 
     const t = o.t ?? now();

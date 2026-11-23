@@ -99,12 +99,12 @@ export function createOverlay(canvas) {
     ctx.lineWidth = 7;
     ctx.stroke();
     ctx.strokeStyle = c;
-    ctx.lineWidth = 3;
+    ctx.lineWidth = it.kind === 'color' ? 2.5 : 3;
     ctx.stroke();
     ctx.restore();
     if (it.label) {
       if (it.kind === 'pair') badge(it.x, it.y, it.label, c, it.alpha);
-      else pill(it.x, Math.max(14, topY - 14), it.label, c, '#06240f', it.alpha);
+      else if (it.kind !== 'color') pill(it.x, Math.max(14, topY - 14), it.label, c, '#06240f', it.alpha);
     }
   }
 

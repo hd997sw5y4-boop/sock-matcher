@@ -3,6 +3,7 @@ import { createCamera } from './camera.js';
 import { generateDemoPile } from './demo.js';
 import { createOverlay, SLOT_COLORS, MATCH_COLOR } from './overlay.js';
 import { createMlClient } from './ml/client.js';
+import { COLOR_CHIPS, chipTint } from './cv/colorClass.js';
 
 const $ = (id) => document.getElementById(id);
 const video = $('video');
@@ -69,6 +70,7 @@ const state = {
   resultMap: null,
   resultRect: null,
   hasRef: false,
+  colorQuery: { id: 'pink' },
   mlResult: null,
   lastSubmit: 0,
   stillDirty: false,
@@ -195,6 +197,7 @@ function submit(now) {
     still: !!state.still,
     t: now,
     roi: roiFor(lay),
+    colorQuery: state.mode === 'colors' ? state.colorQuery : undefined,
     ...state.pending,
   };
   const g0 = performance.now();
@@ -210,7 +213,7 @@ function submit(now) {
 
 function hasPending() {
   const p = state.pending;
-  return !!(p.scanBox || p.tap || p.surfaceTap || p.surfaceAuto);
+  return !!(p.scanBox || p.tap || p.colorTap || p.surfaceTap || p.surfaceAuto);
 }
 
 function queueVision() {
@@ -261,6 +264,19 @@ function onResult(res) {
   perf.visionTimes.push(performance.now());
   if (perf.visionTimes.length > 30) perf.visionTimes.shift();
   if (res.scan) onScanResult(res, lay);
+  if (res.colorPick) {
+    state.colorQuery = {
+      id: 'pick',
+      L: res.colorPick.L,
+      a: res.colorPick.a,
+      b: res.colorPick.b,
+      name: res.colorPick.name,
+    };
+    syncColorChips();
+    toast(`Picked ${res.colorPick.name}`);
+    // Hits on this frame were computed before the pick existed — run once more.
+    queueVision();
+  }
   state.hasRef = !!res.ref || state.hasRef;
   updateTargets(res);
   updateUi();
@@ -292,6 +308,18 @@ function mlStatusText() {
 
 function updateTargets(res) {
   if (!res) return;
+  if (state.mode === 'colors') {
+    const hits = res.colorHits || [];
+    const tint = chipTint(state.colorQuery?.id || 'pink');
+    const targets = hits.map((h, i) => ({
+      key: `c${Math.round(h.cx / 6)}_${Math.round(h.cy / 6)}`,
+      track: { id: i, cx: h.cx, cy: h.cy, vx: 0, vy: 0, outline: h.outline, box: h.box },
+      color: tint,
+      kind: 'color',
+    }));
+    overlay.setTargets(targets, performance.now());
+    return;
+  }
   const byId = new Map(res.tracks.map((t) => [t.id, t]));
   const lists = displayLists(res);
   const targets = [];
@@ -355,8 +383,25 @@ function onScanResult(res, lay) {
   requestRefEmbed(res, lay);
 }
 
+function colorCountLabel(n) {
+  const q = state.colorQuery || { id: 'pink' };
+  const chip = COLOR_CHIPS.find((c) => c.id === q.id);
+  const name = q.id === 'pick'
+    ? (q.name ? `that ${q.name}` : 'that color')
+    : (chip?.label || q.id).toLowerCase();
+  if (q.id === 'multi') return n ? `${n} patterned sock${n === 1 ? '' : 's'}` : 'Looking for patterned socks…';
+  return n ? `${n} ${name} sock${n === 1 ? '' : 's'}` : `Looking for ${name} socks…`;
+}
+
 function updateUi() {
   const res = state.result;
+  if (state.mode === 'colors') {
+    const n = res?.colorHits?.length || 0;
+    const picking = state.colorQuery?.id === 'pick' && !Number.isFinite(state.colorQuery?.L);
+    setChip(picking ? 'Tap a sock to pick its color' : colorCountLabel(n));
+    refCard.hidden = true;
+    return;
+  }
   if (state.mode === 'scan') {
     shutter.querySelector('.shutter-label').textContent = state.hasRef ? 'Rescan' : 'Scan';
     shutter.classList.remove('on');
@@ -529,13 +574,21 @@ function setMode(mode, keepRef = false) {
   state.mode = mode;
   $('mode-scan').classList.toggle('active', mode === 'scan');
   $('mode-pairs').classList.toggle('active', mode === 'pairs');
+  $('mode-colors').classList.toggle('active', mode === 'colors');
   $('mode-scan').setAttribute('aria-selected', String(mode === 'scan'));
   $('mode-pairs').setAttribute('aria-selected', String(mode === 'pairs'));
+  $('mode-colors').setAttribute('aria-selected', String(mode === 'colors'));
+  document.getElementById('app').classList.toggle('mode-colors', mode === 'colors');
+  const chips = $('color-chips');
+  if (chips) chips.hidden = mode !== 'colors';
+  shutter.hidden = mode === 'colors';
   if (state.frozen && mode === 'scan') setFrozen(false);
   overlay.setTargets([], performance.now());
-  if (!keepRef && mode === 'pairs') { /* keep the scanned sock for when they come back */ }
+  if (mode === 'colors') syncColorChips();
   updateUi();
   reprocessStill();
+  // Live camera: force a frame so color hits appear right away.
+  if (!state.still && state.source === 'camera') queueVision();
 }
 
 function workSnapshot(lay) {
@@ -603,6 +656,7 @@ ml.onChange((s) => {
 
 async function maybeScore(res) {
   if (!USE_ML || !ml.isReady() || !res || document.hidden) return;
+  if (state.mode === 'colors') return;
   if (state.mode === 'scan' && !state.hasRef) return;
   const lay = state.resultLayout;
   const img = workSnapshot(lay);
@@ -689,6 +743,13 @@ function onTap(ev) {
     reprocessStill();
     return;
   }
+  if (state.mode === 'colors') {
+    if (state.colorQuery?.id === 'pick') {
+      state.pending.colorTap = { x: wx, y: wy };
+      queueVision();
+    }
+    return;
+  }
   state.pending.tap = { x: wx, y: wy };
   queueVision();
 }
@@ -698,6 +759,54 @@ function syncTorch() {
   $('btn-torch').hidden = !ok;
   if (!ok) state.torch = false;
   $('btn-torch').classList.toggle('active', state.torch);
+}
+
+
+function buildColorChips() {
+  const row = $('color-chips');
+  if (!row || row.dataset.ready) return;
+  row.dataset.ready = '1';
+  for (const c of COLOR_CHIPS) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'color-chip';
+    btn.dataset.id = c.id;
+    btn.setAttribute('role', 'option');
+    btn.setAttribute('aria-label', c.label);
+    btn.innerHTML = `<span class="swatch" style="--swatch:${c.swatch}"></span><span class="chip-label">${c.id === 'pick' ? 'Pick' : c.label}</span>`;
+    btn.addEventListener('click', () => selectColor(c.id));
+    row.appendChild(btn);
+  }
+  syncColorChips();
+}
+
+function selectColor(id) {
+  if (id === 'pick') state.colorQuery = { id: 'pick' };
+  else state.colorQuery = { id };
+  syncColorChips();
+  updateUi();
+  overlay.setTargets([], performance.now());
+  queueVision();
+}
+
+function syncColorChips() {
+  const row = $('color-chips');
+  if (!row) return;
+  const id = state.colorQuery?.id || 'pink';
+  for (const btn of row.querySelectorAll('.color-chip')) {
+    const on = btn.dataset.id === id;
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-selected', String(on));
+    if (btn.dataset.id === 'pick' && Number.isFinite(state.colorQuery?.L)) {
+      const q = state.colorQuery;
+      // Approximate sRGB swatch from the picked Lab so the chip shows what was tapped.
+      btn.querySelector('.swatch').style.background = chipTint(q.name || 'pick');
+      btn.querySelector('.chip-label').textContent = 'Picked';
+    } else if (btn.dataset.id === 'pick') {
+      btn.querySelector('.swatch').style.background = '';
+      btn.querySelector('.chip-label').textContent = 'Pick';
+    }
+  }
 }
 
 function bind() {
@@ -716,6 +825,8 @@ function bind() {
   });
   $('mode-scan').addEventListener('click', () => setMode('scan'));
   $('mode-pairs').addEventListener('click', () => setMode('pairs'));
+  $('mode-colors').addEventListener('click', () => setMode('colors'));
+  buildColorChips();
   $('btn-clear-ref').addEventListener('click', (e) => { e.stopPropagation(); clearRef(); });
 
   $('btn-torch').addEventListener('click', async () => {
@@ -808,6 +919,8 @@ function exposeDebug() {
         perf: perfSummary(),
         ml: { ...ml.getState(), result: state.mlResult },
         displayed: r ? displayLists(r) : null,
+        colorQuery: state.colorQuery,
+        colorHits: r ? (r.colorHits || []).length : 0,
         batterySaver,
         power: {
           maxSide: MAX_VISION_SIDE,
