@@ -1,143 +1,164 @@
-import { rgbToHsv, rgbToLab, l1Normalize, labDist } from './color.js';
-import { erodePixels } from './detect.js';
+/**
+ * Sock descriptor: a mix of robust color, pattern and layout signals.
+ *  - ab: soft 8x8 a*b* chroma histogram (after per-frame gray-world WB)
+ *  - lh: soft 8-bin lightness histogram, normalized to the frame surface
+ *  - pal: 3 dominant Lab colors (tiny k-means) with weights
+ *  - bands: 5 mean-Lab bands along the sock's long axis (cuff..toe)
+ *  - ori: gradient orientation histogram relative to the long axis
+ *  - edge / stripes: texture density and stripe frequency along the axis
+ *  - shape: elongation + area
+ */
+const AB_B = 8, AB_LO = -40, AB_SPAN = 80;
+const L_B = 8;
+const BANDS = 5;
+const PROF = 16;
 
-const H_BINS = 16;
-const S_BINS = 8;
-const L_BINS = 8;
-const AB_BINS = 6; // 6x6 a*b* grid
-
-export function describeBlob(blob, rgba, lab, mask, w, h) {
-  const inner = erodePixels(blob.pixels, mask, w, h, blob.area > 400 ? 2 : 1);
-  const histH = new Float32Array(H_BINS);
-  const histS = new Float32Array(S_BINS);
-  const histL = new Float32Array(L_BINS);
-  const histAB = new Float32Array(AB_BINS * AB_BINS);
+export function describeRegion(r, planes, w, h, regionMap, refL) {
+  const { L, A, B, Ls, As, Bs } = planes;
+  const px = r.pixels;
+  const ab = new Float32Array(AB_B * AB_B);
+  const lh = new Float32Array(L_B);
+  const ori = new Float32Array(8);
+  const pL = new Float32Array(PROF), pA = new Float32Array(PROF), pB = new Float32Array(PROF), pN = new Float32Array(PROF);
+  const ca = Math.cos(r.angle), sa = Math.sin(r.angle);
+  const half = Math.max(1, r.major * 1.9);
+  // Lightness relative to the surface brightness: survives exposure shifts.
+  const lScale = 62 / Math.max(25, refL || 62);
+  let edge = 0, interior = 0, mL = 0, mA = 0, mB = 0;
+  const step = px.length > 1600 ? 2 : 1;
   const samples = [];
-
-  let sumL = 0, sumA = 0, sumB = 0;
-  let edge = 0, gSum = 0, gSum2 = 0, gN = 0;
-  const orient = new Float32Array(8);
-
-  for (const i of inner) {
-    const p = i * 4;
-    const r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
-    const [hh, ss, vv] = rgbToHsv(r, g, b);
-    const li = i * 3;
-    const L = lab[li], A = lab[li + 1], B = lab[li + 2];
-    sumL += L; sumA += A; sumB += B;
-
-    // Hue only counts when the pixel actually has color.
-    const hueW = ss * Math.min(1, vv / 0.15);
-    histH[Math.min(H_BINS - 1, (hh * H_BINS) | 0)] += hueW;
-    histS[Math.min(S_BINS - 1, (ss * S_BINS) | 0)] += 1;
-    histL[Math.min(L_BINS - 1, (Math.max(0, Math.min(99, L)) / 100 * L_BINS) | 0)] += 1;
-
-    const ai = Math.max(0, Math.min(AB_BINS - 1, (((A + 80) / 160) * AB_BINS) | 0));
-    const bi = Math.max(0, Math.min(AB_BINS - 1, (((B + 80) / 160) * AB_BINS) | 0));
-    histAB[ai * AB_BINS + bi] += 1;
-
-    if (ss > 0.12 && vv > 0.12) samples.push([L, A, B]);
-
+  for (let k = 0; k < px.length; k += step) {
+    const i = px[k];
     const x = i % w, y = (i / w) | 0;
-    if (x > blob.minX && x < blob.maxX && y > blob.minY && y < blob.maxY) {
-      const lR = lab[((y * w + (x + 1)) * 3)];
-      const lL = lab[((y * w + (x - 1)) * 3)];
-      const lD = lab[(((y + 1) * w + x) * 3)];
-      const lU = lab[(((y - 1) * w + x) * 3)];
-      const gx = lR - lL;
-      const gy = lD - lU;
-      const mag = Math.hypot(gx, gy);
-      gSum += mag;
-      gSum2 += mag * mag;
-      gN++;
-      if (mag > 6) {
-        edge++;
-        let ang = Math.atan2(gy, gx);
-        if (ang < 0) ang += Math.PI; // unsigned orientation
-        orient[Math.min(7, (ang / Math.PI * 8) | 0)] += mag;
+    const id = r.id;
+    // Skip the 1px rim — it mixes with the surface.
+    if (x <= 0 || y <= 0 || x >= w - 1 || y >= h - 1) continue;
+    if (regionMap[i - 1] !== id || regionMap[i + 1] !== id || regionMap[i - w] !== id || regionMap[i + w] !== id) continue;
+    interior++;
+    const l = Math.min(100, Ls[i] * lScale), a = As[i], b = Bs[i];
+    mL += l; mA += a; mB += b;
+    // Soft chroma histogram.
+    const fa = ((a - AB_LO) / AB_SPAN) * AB_B - 0.5, fb = ((b - AB_LO) / AB_SPAN) * AB_B - 0.5;
+    const a0 = Math.floor(fa), b0 = Math.floor(fb), ta = fa - a0, tb = fb - b0;
+    for (let da = 0; da <= 1; da++) {
+      const ai = Math.max(0, Math.min(AB_B - 1, a0 + da));
+      const wa = da ? ta : 1 - ta;
+      for (let db = 0; db <= 1; db++) {
+        const bi = Math.max(0, Math.min(AB_B - 1, b0 + db));
+        ab[ai * AB_B + bi] += wa * (db ? tb : 1 - tb);
       }
     }
+    const fl = (l / 100) * L_B - 0.5, l0 = Math.floor(fl), tl = fl - l0;
+    lh[Math.max(0, Math.min(L_B - 1, l0))] += 1 - tl;
+    lh[Math.max(0, Math.min(L_B - 1, l0 + 1))] += tl;
+    // Axis profile.
+    const u = ((x - r.cx) * ca + (y - r.cy) * sa) / half; // -1..1 roughly
+    const pi = Math.max(0, Math.min(PROF - 1, ((u + 1) / 2 * PROF) | 0));
+    pL[pi] += l; pA[pi] += a; pB[pi] += b; pN[pi]++;
+    // Texture on the unblurred L.
+    const gx = L[i + 1] - L[i - 1], gy = L[i + w] - L[i - w];
+    const mag = Math.abs(gx) + Math.abs(gy);
+    if (mag > 7) {
+      edge++;
+      let ang = Math.atan2(gy, gx) - r.angle;
+      ang = ((ang % Math.PI) + Math.PI) % Math.PI;
+      ori[Math.min(7, (ang / Math.PI * 8) | 0)] += mag;
+    }
+    if ((k & 3) === 0) samples.push(l, a, b);
   }
-
-  const n = inner.length || 1;
-  l1Normalize(histH);
-  l1Normalize(histS);
-  l1Normalize(histL);
-  l1Normalize(histAB);
-  l1Normalize(orient);
-
-  const mean = [sumL / n, sumA / n, sumB / n];
-  const palette = kMeansPalette(samples.length ? samples : [[mean[0], mean[1], mean[2]]], 3);
-  const edgeDensity = edge / n;
-  const gradMean = gN ? gSum / gN : 0;
-  const gradVar = gN ? Math.max(0, gSum2 / gN - gradMean * gradMean) : 0;
-
+  const cnt = Math.max(1, interior);
+  norm(ab); norm(lh); norm(ori);
+  // Bands from the profile (fill empty profile bins from neighbours).
+  for (let p = 0; p < PROF; p++) {
+    if (pN[p]) { pL[p] /= pN[p]; pA[p] /= pN[p]; pB[p] /= pN[p]; }
+  }
+  fillGaps(pL, pA, pB, pN, mL / cnt, mA / cnt, mB / cnt);
+  const bands = new Float32Array(BANDS * 3);
+  for (let bnd = 0; bnd < BANDS; bnd++) {
+    const p0 = Math.round(bnd * PROF / BANDS), p1 = Math.round((bnd + 1) * PROF / BANDS);
+    let s = 0, l = 0, a = 0, b = 0;
+    for (let p = p0; p < p1; p++) { const wgt = pN[p] + 0.5; l += pL[p] * wgt; a += pA[p] * wgt; b += pB[p] * wgt; s += wgt; }
+    bands[bnd * 3] = l / s; bands[bnd * 3 + 1] = a / s; bands[bnd * 3 + 2] = b / s;
+  }
+  // Stripe frequency: sign changes of the detrended L profile with enough amplitude.
+  let stripes = 0, last = 0;
+  for (let p = 1; p < PROF - 1; p++) {
+    const d = pL[p] - (pL[p - 1] + pL[p + 1]) / 2;
+    if (Math.abs(d) < 3) continue;
+    const s = d > 0 ? 1 : -1;
+    if (last && s !== last) stripes++;
+    last = s;
+  }
   return {
-    histH, histS, histL, histAB, mean, palette,
-    edgeDensity, gradMean, gradVar, orient,
-    aspect: blob.aspect,
-    area: blob.area,
-    elongation: blob.elongation,
+    ab, lh, ori, bands,
+    mean: [mL / cnt, mA / cnt, mB / cnt],
+    pal: palette(samples, 3),
+    edge: edge / cnt,
+    stripes,
+    elong: r.elongation,
+    area: r.area,
+    n: interior,
   };
 }
 
-function kMeansPalette(samples, k) {
-  if (samples.length <= k) {
-    return samples.map((s) => ({ L: s[0], a: s[1], b: s[2], w: 1 / Math.max(1, samples.length) }));
-  }
-  // Init: spread along first 3 unique-ish samples.
-  const centers = [];
-  const step = Math.max(1, (samples.length / k) | 0);
-  for (let i = 0; i < k; i++) {
-    const s = samples[Math.min(samples.length - 1, i * step)];
-    centers.push([s[0], s[1], s[2]]);
-  }
-  const assign = new Int16Array(samples.length);
-  const counts = new Float32Array(k);
-  for (let iter = 0; iter < 7; iter++) {
-    counts.fill(0);
-    const acc = Array.from({ length: k }, () => [0, 0, 0]);
-    for (let i = 0; i < samples.length; i++) {
-      const s = samples[i];
-      let best = 0, bestD = Infinity;
-      for (let c = 0; c < k; c++) {
-        const d = labDist(s[0], s[1], s[2], centers[c][0], centers[c][1], centers[c][2]);
-        if (d < bestD) { bestD = d; best = c; }
-      }
-      assign[i] = best;
-      counts[best]++;
-      acc[best][0] += s[0]; acc[best][1] += s[1]; acc[best][2] += s[2];
-    }
-    for (let c = 0; c < k; c++) {
-      if (counts[c] > 0) {
-        centers[c][0] = acc[c][0] / counts[c];
-        centers[c][1] = acc[c][1] / counts[c];
-        centers[c][2] = acc[c][2] / counts[c];
-      }
-    }
-  }
-  const total = samples.length;
-  const palette = [];
-  for (let c = 0; c < k; c++) {
-    palette.push({ L: centers[c][0], a: centers[c][1], b: centers[c][2], w: counts[c] / total });
-  }
-  palette.sort((x, y) => y.w - x.w);
-  return palette;
+function norm(a) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i];
+  if (s > 0) for (let i = 0; i < a.length; i++) a[i] /= s;
 }
 
-export function paletteDistance(p, q) {
-  // Earth-mover-ish: each color in p to nearest in q, weighted, symmetric.
-  const oneWay = (a, b) => {
-    let s = 0;
-    for (const ca of a) {
-      let best = Infinity;
-      for (const cb of b) {
-        const d = labDist(ca.L, ca.a, ca.b, cb.L, cb.a, cb.b);
-        if (d < best) best = d;
-      }
-      s += ca.w * best;
+function fillGaps(pL, pA, pB, pN, dl, da, db) {
+  const n = pL.length;
+  for (let p = 0; p < n; p++) {
+    if (pN[p]) continue;
+    let q = -1;
+    for (let d = 1; d < n && q < 0; d++) {
+      if (p - d >= 0 && pN[p - d]) q = p - d; else if (p + d < n && pN[p + d]) q = p + d;
     }
-    return s;
-  };
-  return 0.5 * (oneWay(p, q) + oneWay(q, p));
+    if (q >= 0) { pL[p] = pL[q]; pA[p] = pA[q]; pB[p] = pB[q]; } else { pL[p] = dl; pA[p] = da; pB[p] = db; }
+  }
+}
+
+function palette(s, k) {
+  const m = s.length / 3;
+  if (!m) return [{ L: 50, a: 0, b: 0, w: 1 }];
+  if (m <= k) {
+    const out = [];
+    for (let i = 0; i < m; i++) out.push({ L: s[i * 3], a: s[i * 3 + 1], b: s[i * 3 + 2], w: 1 / m });
+    return out;
+  }
+  // k-means++-ish deterministic init: darkest, brightest, most chromatic.
+  const c = new Float32Array(k * 3);
+  let iD = 0, iB = 0, iC = 0, vD = 1e9, vB = -1e9, vC = -1;
+  for (let i = 0; i < m; i++) {
+    const l = s[i * 3], ch = s[i * 3 + 1] ** 2 + s[i * 3 + 2] ** 2;
+    if (l < vD) { vD = l; iD = i; }
+    if (l > vB) { vB = l; iB = i; }
+    if (ch > vC) { vC = ch; iC = i; }
+  }
+  [iD, iB, iC].slice(0, k).forEach((idx, j) => { c[j * 3] = s[idx * 3]; c[j * 3 + 1] = s[idx * 3 + 1]; c[j * 3 + 2] = s[idx * 3 + 2]; });
+  const acc = new Float32Array(k * 4);
+  for (let it = 0; it < 6; it++) {
+    acc.fill(0);
+    for (let i = 0; i < m; i++) {
+      const l = s[i * 3], a = s[i * 3 + 1], b = s[i * 3 + 2];
+      let best = 0, bd = 1e12;
+      for (let j = 0; j < k; j++) {
+        const dl = (l - c[j * 3]) * 0.7, da = a - c[j * 3 + 1], db = b - c[j * 3 + 2];
+        const d = dl * dl + da * da + db * db;
+        if (d < bd) { bd = d; best = j; }
+      }
+      acc[best * 4] += l; acc[best * 4 + 1] += a; acc[best * 4 + 2] += b; acc[best * 4 + 3]++;
+    }
+    for (let j = 0; j < k; j++) {
+      const q = acc[j * 4 + 3];
+      if (q) { c[j * 3] = acc[j * 4] / q; c[j * 3 + 1] = acc[j * 4 + 1] / q; c[j * 3 + 2] = acc[j * 4 + 2] / q; }
+    }
+  }
+  const out = [];
+  for (let j = 0; j < k; j++) {
+    const q = acc[j * 4 + 3];
+    if (q) out.push({ L: c[j * 3], a: c[j * 3 + 1], b: c[j * 3 + 2], w: q / m });
+  }
+  return out.sort((x, y) => y.w - x.w);
 }

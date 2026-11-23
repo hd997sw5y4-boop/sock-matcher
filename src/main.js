@@ -1,55 +1,62 @@
-import { createProcessor } from './cv/process.js';
-import { createTracker } from './cv/track.js';
-import { descriptorSimilarity } from './cv/match.js';
+import { createVision } from './vision.js';
 import { createCamera } from './camera.js';
-import { generateDemoPile, sockBounds } from './demo.js';
-import { createMapper, drawDisplayFrame, renderOverlay, hitTestSock } from './overlay.js';
+import { generateDemoPile } from './demo.js';
+import { createOverlay, SLOT_COLORS, MATCH_COLOR } from './overlay.js';
 
 const $ = (id) => document.getElementById(id);
-
 const video = $('video');
 const frame = $('frame');
-const overlay = $('overlay');
+const overlayCanvas = $('overlay');
 const gate = $('gate');
-const statusChip = $('status-chip');
+const chip = $('status-chip');
 const toastEl = $('toast');
 const fileInput = $('file-input');
-const btnFreeze = $('btn-freeze');
+const shutter = $('btn-shutter');
+const refCard = $('ref-card');
+const refThumb = $('ref-thumb');
+const hud = $('perf-hud');
+const DEBUG = new URLSearchParams(location.search).has('debug');
 
 const camera = createCamera(video);
-const processor = createProcessor();
-const tracker = createTracker();
+const overlay = createOverlay(overlayCanvas);
+const vision = createVision(onResult);
+
+const CAMERA_PIXELS = 90_000; // vision buffer size (about 210x430 on a phone)
+const STILL_PIXELS = 140_000;
+const MIN_INTERVAL = 60; // ms between vision frames (<= ~16 Hz)
 
 const state = {
-  mode: 'pairs', // 'pairs' | 'tap'
+  mode: 'scan',
   source: null, // 'camera' | 'photo' | 'demo'
+  still: null,
   frozen: false,
   torch: false,
   sensitivity: 0.5,
   strictness: 0.55,
   awaitingSurfaceTap: false,
-  srcW: 0,
-  srcH: 0,
-  workW: 0,
-  workH: 0,
-  socks: [],
-  pairs: [],
-  unmatched: [],
-  selected: null,
-  matches: [],
+  view: { w: 0, h: 0, dpr: 1 },
+  pending: {},
+  submissions: new Map(),
+  result: null,
+  resultMap: null,
+  resultRect: null,
+  hasRef: false,
+  lastSubmit: 0,
+  stillDirty: false,
   demoTruth: null,
-  lastResult: null,
-  lastProcess: 0,
-  stillImage: null, // HTMLCanvasElement | HTMLImageElement
+  waiters: [],
+};
+
+const perf = {
+  frames: [], // rAF intervals
+  overlayMs: [],
+  grabMs: [],
+  visionMs: [],
+  visionTimes: [],
+  last: 0,
 };
 
 let toastTimer = 0;
-let anim = 0;
-
-function showGate(show) {
-  gate.classList.toggle('hidden', !show);
-}
-
 function toast(msg, ms = 2200) {
   toastEl.hidden = false;
   toastEl.textContent = msg;
@@ -57,213 +64,294 @@ function toast(msg, ms = 2200) {
   toastTimer = setTimeout(() => { toastEl.hidden = true; }, ms);
 }
 
-function setChip() {
-  const nPairs = state.pairs.length;
-  const nSolo = state.unmatched.length;
-  let text = '';
-  if (!state.socks.length) {
-    text = 'No socks found — spread them out';
-  } else if (state.mode === 'tap') {
-    text = state.selected
-      ? (state.matches.length ? `Best match ${Math.round(state.matches[0].score * 100)}%` : 'Tap looks unmatched')
-      : 'Tap a sock to find its match';
-  } else {
-    text = nPairs
-      ? `${nPairs} pair${nPairs === 1 ? '' : 's'}${nSolo ? ` · ${nSolo} leftover` : ''}`
-      : `${state.socks.length} sock${state.socks.length === 1 ? '' : 's'} · no pairs yet`;
-  }
-  if (state.frozen) text = `Frozen · ${text}`;
-  statusChip.hidden = false;
-  statusChip.textContent = text;
-  statusChip.classList.toggle('frozen', state.frozen);
+function setChip(text) {
+  chip.hidden = !gate.classList.contains('hidden') || !text;
+  chip.textContent = text || '';
+  chip.classList.toggle('frozen', state.frozen);
 }
 
-function hideChipIfGated() {
-  if (!gate.classList.contains('hidden')) statusChip.hidden = true;
-}
-
-function resizeCanvases() {
+function measure() {
   const stage = $('stage');
-  const w = stage.clientWidth;
-  const h = stage.clientHeight;
-  const dpr = Math.min(2.5, window.devicePixelRatio || 1);
-  for (const c of [frame, overlay]) {
-    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
-      c.width = Math.round(w * dpr);
-      c.height = Math.round(h * dpr);
-      c.style.width = `${w}px`;
-      c.style.height = `${h}px`;
-    }
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  state.view = { w, h, dpr };
+  for (const c of [overlayCanvas, frame]) {
+    const cw = Math.round(w * dpr), ch = Math.round(h * dpr);
+    if (c.width !== cw || c.height !== ch) { c.width = cw; c.height = ch; }
   }
-  return { w, h, dpr };
+  if (state.still) drawStill();
 }
 
-function currentSource() {
-  if (state.stillImage) return state.stillImage;
-  if (state.source === 'camera' && video.videoWidth) return video;
-  return null;
-}
-
-function sourceSize(src) {
-  if (src === video) return { w: video.videoWidth, h: video.videoHeight };
-  return { w: src.width, h: src.height };
-}
-
-function processNow() {
-  const src = currentSource();
-  if (!src) return;
-  const { w: srcW, h: srcH } = sourceSize(src);
-  if (!srcW || !srcH) return;
-  state.srcW = srcW;
-  state.srcH = srcH;
-  const result = processor.run(src, {
-    srcW, srcH,
-    sensitivity: state.sensitivity,
-    strictness: state.strictness,
-  });
-  state.lastResult = result;
-  state.workW = result.w;
-  state.workH = result.h;
-  const tracked = tracker.update(result.blobs, result.descs, result.pairing, result.w, result.h);
-  state.socks = tracked.socks;
-  state.pairs = tracked.pairs;
-  state.unmatched = tracked.unmatched;
-  refreshSelection();
-  setChip();
-}
-
-function refreshSelection() {
-  if (state.mode !== 'tap' || !state.selected) {
-    state.matches = [];
-    return;
+/** Where the source is shown on screen and which part of it we analyse. */
+function layoutFor(src) {
+  const { w: vw, h: vh } = state.view;
+  const sw0 = src === video ? video.videoWidth : src.width;
+  const sh0 = src === video ? video.videoHeight : src.height;
+  if (!sw0 || !sh0 || !vw || !vh) return null;
+  if (src === video) {
+    // object-fit: cover — analyse exactly the visible part.
+    const s = Math.max(vw / sw0, vh / sh0);
+    const sw = vw / s, sh = vh / s;
+    const rect = { sx: (sw0 - sw) / 2, sy: (sh0 - sh) / 2, sw, sh };
+    const ww = Math.max(120, Math.round(Math.sqrt(CAMERA_PIXELS * vw / vh)));
+    const wh = Math.round(ww * vh / vw);
+    const k = vw / ww;
+    const mirror = camera.isFront();
+    return {
+      rect, w: ww, h: wh,
+      map: {
+        scale: k, mirror,
+        toView: (x, y) => [mirror ? vw - x * k : x * k, y * k],
+        toWork: (x, y) => [(mirror ? vw - x : x) / k, y / k],
+      },
+    };
   }
-  // Re-attach selected sock by trackId, then nearest center.
-  let sel = state.socks.find((s) => s.trackId === state.selected.trackId && s.trackId > 0);
-  if (!sel) {
-    sel = state.socks.find((s) => Math.hypot(s.cx - state.selected.cx, s.cy - state.selected.cy) < 24);
-  }
-  if (!sel) {
-    state.selected = null;
-    state.matches = [];
-    return;
-  }
-  state.selected = sel;
-  const scored = state.socks
-    .filter((s) => s.index !== sel.index)
-    .map((s) => ({ index: s.index, score: descriptorSimilarity(sel.desc, s.desc), sock: s }))
-    .sort((a, b) => b.score - a.score);
-  const threshold = 0.42 + state.strictness * 0.36;
-  const top = scored[0];
-  // Show the best match if it clears the bar; if a close second exists, show it too.
-  state.matches = [];
-  if (top && top.score >= threshold * 0.92) {
-    state.matches.push(top);
-    if (scored[1] && scored[1].score >= top.score - 0.04 && scored[1].score >= threshold) {
-      state.matches.push(scored[1]);
-    }
-  }
-}
-
-function paint(ts) {
-  anim = requestAnimationFrame(paint);
-  const src = currentSource();
-  const { w, h, dpr } = resizeCanvases();
-  const fctx = frame.getContext('2d');
-  fctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  if (!src) {
-    fctx.fillStyle = '#111';
-    fctx.fillRect(0, 0, w, h);
-    return;
-  }
-  const { w: srcW, h: srcH } = sourceSize(src);
-  const mirror = state.source === 'camera' && camera.isFront();
-  const fit = state.source === 'camera' ? 'cover' : 'contain';
-  drawDisplayFrame(fctx, src, w, h, srcW, srcH, mirror, fit);
-
-  const live = state.source === 'camera' && !state.frozen;
-  if (srcW && srcH && (live || !state.lastResult)) {
-    if (!live || ts - state.lastProcess > 70) {
-      processNow();
-      state.lastProcess = ts;
-    }
-  }
-
-  const octx = overlay.getContext('2d');
-  const mapper = createMapper(state.srcW || srcW, state.srcH || srcH, w, h, fit);
-  // If the display is mirrored (front camera), wrap mapper.
-  const viewMapper = mirror ? mirrorMapper(mapper, w) : mapper;
-  renderOverlay(octx, {
-    viewW: w,
-    viewH: h,
-    dpr,
-    mapper: viewMapper,
-    workW: state.workW,
-    workH: state.workH,
-    mode: state.mode,
-    socks: state.socks,
-    pairs: state.pairs,
-    unmatched: state.unmatched,
-    selected: state.selected,
-    matches: state.matches,
-    frozen: state.frozen,
-  }, ts);
-}
-
-function mirrorMapper(mapper, viewW) {
+  const s = Math.min(vw / sw0, vh / sh0);
+  const dw = sw0 * s, dh = sh0 * s, ox = (vw - dw) / 2, oy = (vh - dh) / 2;
+  const ww = Math.round(Math.sqrt(STILL_PIXELS * sw0 / sh0));
+  const wh = Math.round(ww * sh0 / sw0);
+  const k = dw / ww;
   return {
-    ...mapper,
-    workToView(x, y, ww, wh) {
-      const [vx, vy] = mapper.workToView(x, y, ww, wh);
-      return [viewW - vx, vy];
-    },
-    viewToWork(x, y, ww, wh) {
-      return mapper.viewToWork(viewW - x, y, ww, wh);
+    rect: { sx: 0, sy: 0, sw: sw0, sh: sh0 }, w: ww, h: wh, display: { ox, oy, dw, dh },
+    map: {
+      scale: k, mirror: false,
+      toView: (x, y) => [ox + x * k, oy + y * k],
+      toWork: (x, y) => [(x - ox) / k, (y - oy) / k],
     },
   };
 }
 
-function openLive() {
-  showGate(false);
-  hideChipIfGated();
-  setChip();
+/** Work-space rows not hidden behind the top bar and the bottom dock. */
+function roiFor(lay) {
+  const top = $('topbar').getBoundingClientRect().bottom;
+  const dock = $('dock').getBoundingClientRect().top;
+  const y0 = lay.map.toWork(0, top)[1];
+  const y1 = lay.map.toWork(0, dock - 8)[1];
+  return { y0: Math.max(0, y0), y1: Math.min(lay.h, y1) };
+}
+
+function currentSource() {
+  if (state.still) return state.still;
+  if (state.source === 'camera' && video.videoWidth) return video;
+  return null;
+}
+
+function drawStill() {
+  const { w, h, dpr } = state.view;
+  const fctx = frame.getContext('2d');
+  fctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  fctx.fillStyle = '#111';
+  fctx.fillRect(0, 0, w, h);
+  const lay = layoutFor(state.still);
+  if (!lay) return;
+  const { ox, oy, dw, dh } = lay.display;
+  fctx.drawImage(state.still, ox, oy, dw, dh);
+}
+
+function submit(now) {
+  const src = currentSource();
+  if (!src) return false;
+  const lay = layoutFor(src);
+  if (!lay) return false;
+  const opts = {
+    mode: state.mode,
+    sensitivity: state.sensitivity,
+    strictness: state.strictness,
+    still: !!state.still,
+    t: now,
+    roi: roiFor(lay),
+    ...state.pending,
+  };
+  const g0 = performance.now();
+  const seq = vision.submit(src, lay.rect, lay.w, lay.h, opts);
+  if (!seq) return false;
+  push(perf.grabMs, performance.now() - g0);
+  state.pending = {};
+  state.lastSubmit = now;
+  state.submissions.set(seq, lay);
+  if (state.submissions.size > 8) state.submissions.delete(state.submissions.keys().next().value);
+  return true;
+}
+
+function onResult(res) {
+  const lay = state.submissions.get(res.seq) || [...state.submissions.values()].pop();
+  state.result = res;
+  state.resultMap = lay.map;
+  state.resultRect = lay.rect;
+  state.resultLayout = lay;
+  push(perf.visionMs, res.timing.total);
+  perf.visionTimes.push(performance.now());
+  if (perf.visionTimes.length > 30) perf.visionTimes.shift();
+  if (res.scan) onScanResult(res, lay);
+  state.hasRef = !!res.ref;
+  updateTargets(res);
+  updateUi();
+  if (state.stillDirty && state.still) { state.stillDirty = false; submit(performance.now()); }
+  const waiters = state.waiters.splice(0);
+  for (const fn of waiters) fn(res);
+}
+
+function updateTargets(res) {
+  const byId = new Map(res.tracks.map((t) => [t.id, t]));
+  const targets = [];
+  if (state.mode === 'scan') {
+    for (const m of res.matches) {
+      const t = byId.get(m.id);
+      if (!t || !t.outline) continue;
+      targets.push({ key: `m${m.id}`, track: t, color: MATCH_COLOR, kind: 'match', label: `${Math.round(m.score * 100)}%` });
+    }
+    const refT = res.ref?.excludeId && byId.get(res.ref.excludeId);
+    if (refT && refT.outline) targets.push({ key: `r${refT.id}`, track: refT, kind: 'ref', color: '#ffffff' });
+  } else {
+    for (const p of res.pairs) {
+      const color = SLOT_COLORS[(p.slot - 1) % SLOT_COLORS.length];
+      for (const id of [p.a, p.b]) {
+        const t = byId.get(id);
+        if (!t || !t.outline) continue;
+        targets.push({ key: `p${p.a}-${p.b}-${id}`, track: t, color, kind: 'pair', label: String(p.slot) });
+      }
+    }
+  }
+  overlay.setTargets(targets, performance.now());
+}
+
+function onScanResult(res, lay) {
+  if (!res.scan.ok) {
+    toast('Couldn’t find a sock there — try again');
+    return;
+  }
+  // Thumbnail of the scanned sock, cropped from the source at full resolution.
+  const src = currentSource();
+  if (!src) return;
+  const [x0, y0, x1, y1] = res.scan.box;
+  const fx = lay.rect.sw / lay.w, fy = lay.rect.sh / lay.h;
+  const pad = 3;
+  let sx = lay.rect.sx + (x0 - pad) * fx, sy = lay.rect.sy + (y0 - pad) * fy;
+  let sw = (x1 - x0 + 2 * pad) * fx, sh = (y1 - y0 + 2 * pad) * fy;
+  const side = Math.max(sw, sh);
+  sx -= (side - sw) / 2; sy -= (side - sh) / 2;
+  const tctx = refThumb.getContext('2d');
+  tctx.fillStyle = '#222';
+  tctx.fillRect(0, 0, refThumb.width, refThumb.height);
+  try { tctx.drawImage(src, sx, sy, side, side, 0, 0, refThumb.width, refThumb.height); } catch { /* ignore */ }
+  refCard.hidden = false;
+  if (state.mode !== 'scan') setMode('scan', true);
+  toast('Scanned — now point at the pile');
+}
+
+function updateUi() {
+  const res = state.result;
+  if (state.mode === 'scan') {
+    shutter.querySelector('.shutter-label').textContent = state.hasRef ? 'Rescan' : 'Scan';
+    shutter.classList.remove('on');
+    if (!state.hasRef) setChip(state.still ? 'Tap a sock or Scan the one in the box' : 'Scan one sock to find its match');
+    else if (res && res.matches.length) setChip(`Best match ${Math.round(res.matches[0].score * 100)}%`);
+    else setChip('Looking for its match…');
+  } else {
+    shutter.querySelector('.shutter-label').textContent = state.frozen ? 'Resume' : 'Freeze';
+    shutter.classList.toggle('on', state.frozen);
+    const n = res ? res.pairs.length : 0;
+    setChip(`${state.frozen ? 'Frozen · ' : ''}${n ? `${n} likely pair${n === 1 ? '' : 's'}` : 'Looking for pairs…'}`);
+  }
+  refCard.hidden = !state.hasRef;
+}
+
+function targetBox() {
+  const { w, h } = state.view;
+  const side = Math.min(w * 0.5, h * 0.3);
+  return { x: (w - side) / 2, y: h * 0.42 - side / 2, w: side, h: side };
+}
+
+function loop(ts) {
+  requestAnimationFrame(loop);
+  const dt = perf.last ? ts - perf.last : 16.7;
+  perf.last = ts;
+  push(perf.frames, dt, 240);
+  const live = state.source === 'camera' && !state.frozen && video.videoWidth;
+  if (live && ts - state.lastSubmit >= MIN_INTERVAL && !vision.isBusy()) submit(ts);
+  const showTarget = state.mode === 'scan' && !state.hasRef && state.source && gate.classList.contains('hidden');
+  const map = state.resultMap || { scale: 1, mirror: false, toView: (x, y) => [x, y] };
+  const ms = overlay.render(ts, Math.min(100, dt), state.view, map, { target: showTarget ? targetBox() : null });
+  if (ms) push(perf.overlayMs, ms);
+  if (DEBUG && ts - (perf.hudT || 0) > 500) { perf.hudT = ts; hud.hidden = false; hud.textContent = perfText(); }
+}
+
+function push(arr, v, max = 120) { arr.push(v); if (arr.length > max) arr.shift(); }
+function stats(arr) {
+  if (!arr.length) return { avg: 0, p95: 0 };
+  const s = arr.slice().sort((a, b) => a - b);
+  return { avg: s.reduce((a, b) => a + b, 0) / s.length, p95: s[Math.floor(s.length * 0.95)] };
+}
+function perfSummary() {
+  const f = stats(perf.frames);
+  const t = perf.visionTimes;
+  return {
+    fps: f.avg ? 1000 / f.avg : 0,
+    frameAvg: f.avg, frameP95: f.p95,
+    jank: perf.frames.filter((d) => d > 34).length,
+    overlay: stats(perf.overlayMs), grab: stats(perf.grabMs), vision: stats(perf.visionMs),
+    visionHz: t.length > 1 ? (t.length - 1) * 1000 / (t[t.length - 1] - t[0]) : 0,
+    engine: vision.kind(),
+  };
+}
+function perfText() {
+  const p = perfSummary();
+  return `ui ${p.fps.toFixed(0)}fps p95 ${p.frameP95.toFixed(1)}ms\n`
+    + `vision ${p.visionHz.toFixed(1)}Hz ${p.vision.avg.toFixed(1)}ms (${p.engine})\n`
+    + `grab ${p.grab.avg.toFixed(1)}ms overlay ${p.overlay.avg.toFixed(2)}ms`;
+}
+
+function resetVision(clearRef = false) {
+  vision.reset(!!state.still, clearRef);
+  overlay.clearAll();
+  state.result = null;
+  if (clearRef) { state.hasRef = false; refCard.hidden = true; }
+}
+
+function reprocessStill() {
+  if (!state.still) return;
+  if (!submit(performance.now())) state.stillDirty = true;
 }
 
 async function startCamera() {
   try {
-    state.stillImage = null;
+    state.still = null;
     state.source = 'camera';
-    state.frozen = false;
-    state.selected = null;
-    tracker.reset();
-    processor.unlockSurface();
-    updateSurfaceNote();
+    state.demoTruth = null;
+    frame.classList.remove('show');
+    resetVision(true);
     await camera.start('environment');
-    syncTorchButton();
+    video.classList.toggle('mirror', camera.isFront());
+    syncTorch();
     setFrozen(false);
-    openLive();
-    toast('Spread socks out on a plain surface');
+    gate.classList.add('hidden');
+    updateUi();
+    toast('Put one sock in the box and tap Scan');
   } catch (err) {
     console.warn(err);
     toast('Camera blocked — try Demo or Upload a photo');
   }
 }
 
-function loadDemo() {
+function useStill(canvas, source, truth = null) {
   camera.stop();
-  syncTorchButton();
+  syncTorch();
+  state.still = canvas;
+  state.source = source;
+  state.demoTruth = truth;
+  state.frozen = false;
+  frame.classList.add('show');
+  gate.classList.add('hidden');
+  resetVision(true);
+  measure();
+  updateUi();
+  reprocessStill();
+}
+
+function loadDemo() {
   const demo = generateDemoPile();
-  state.stillImage = demo.canvas;
-  state.source = 'demo';
-  state.demoTruth = demo.socks;
-  state.frozen = true;
-  state.selected = null;
-  tracker.reset();
-  processor.unlockSurface();
-  updateSurfaceNote();
-  setFrozen(true);
-  openLive();
-  processNow();
-  toast('Demo pile ready — 8 pairs');
+  useStill(demo.canvas, 'demo', demo.socks);
+  toast('Demo pile — tap a sock to find its match');
 }
 
 function loadImageFile(file) {
@@ -272,101 +360,94 @@ function loadImageFile(file) {
   const img = new Image();
   img.onload = () => {
     const c = document.createElement('canvas');
-    const max = 1600;
-    const scale = Math.min(1, max / Math.max(img.width, img.height));
+    const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
     c.width = Math.round(img.width * scale);
     c.height = Math.round(img.height * scale);
     c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
     URL.revokeObjectURL(url);
-    camera.stop();
-    syncTorchButton();
-    state.stillImage = c;
-    state.source = 'photo';
-    state.demoTruth = null;
-    state.frozen = true;
-    state.selected = null;
-    tracker.reset();
-    processor.unlockSurface();
-    updateSurfaceNote();
-    setFrozen(true);
-    openLive();
-    processNow();
+    useStill(c, 'photo');
   };
-  img.onerror = () => {
-    URL.revokeObjectURL(url);
-    toast('Could not read that photo');
-  };
+  img.onerror = () => { URL.revokeObjectURL(url); toast('Could not read that photo'); };
   img.src = url;
 }
 
 function setFrozen(on) {
   state.frozen = on;
-  btnFreeze.classList.toggle('on', on);
-  btnFreeze.querySelector('.shutter-label').textContent = on ? 'Resume' : 'Freeze';
-  setChip();
+  if (on && state.source === 'camera') {
+    const { w, h, dpr } = state.view;
+    const fctx = frame.getContext('2d');
+    fctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const s = Math.max(w / video.videoWidth, h / video.videoHeight);
+    const dw = video.videoWidth * s, dh = video.videoHeight * s;
+    fctx.save();
+    if (camera.isFront()) { fctx.translate(w, 0); fctx.scale(-1, 1); }
+    fctx.drawImage(video, (w - dw) / 2, (h - dh) / 2, dw, dh);
+    fctx.restore();
+    frame.classList.add('show');
+  } else if (state.source === 'camera') {
+    frame.classList.remove('show');
+  }
+  updateUi();
 }
 
-function setMode(mode) {
+function setMode(mode, keepRef = false) {
+  if (state.mode === mode) return;
   state.mode = mode;
+  $('mode-scan').classList.toggle('active', mode === 'scan');
   $('mode-pairs').classList.toggle('active', mode === 'pairs');
-  $('mode-tap').classList.toggle('active', mode === 'tap');
+  $('mode-scan').setAttribute('aria-selected', String(mode === 'scan'));
   $('mode-pairs').setAttribute('aria-selected', String(mode === 'pairs'));
-  $('mode-tap').setAttribute('aria-selected', String(mode === 'tap'));
-  if (mode !== 'tap') {
-    state.selected = null;
-    state.matches = [];
-  }
-  setChip();
+  if (state.frozen && mode === 'scan') setFrozen(false);
+  overlay.setTargets([], performance.now());
+  if (!keepRef && mode === 'pairs') { /* keep the scanned sock for when they come back */ }
+  updateUi();
+  reprocessStill();
 }
 
-function syncTorchButton() {
-  const btn = $('btn-torch');
-  const ok = state.source === 'camera' && camera.torchSupported();
-  btn.hidden = !ok;
-  if (!ok) state.torch = false;
-  btn.classList.toggle('active', state.torch);
+function doScan() {
+  const lay = state.resultLayout || layoutFor(currentSource() || video);
+  if (!lay) { toast('Start the camera first'); return; }
+  const b = targetBox();
+  const [x0, y0] = lay.map.toWork(b.x, b.y);
+  const [x1, y1] = lay.map.toWork(b.x + b.w, b.y + b.h);
+  state.pending.scanBox = { x0: Math.min(x0, x1), y0, x1: Math.max(x0, x1), y1 };
+  if (state.frozen) setFrozen(false);
+  reprocessStill();
 }
 
-function updateSurfaceNote() {
-  const note = $('surface-note');
-  note.textContent = processor.isLocked()
-    ? 'Surface color is locked. Tap Auto Surface to go back to estimating from the frame edges.'
-    : 'Surface color is estimated from the edges of the frame.';
+function clearRef() {
+  vision.clearRef();
+  state.hasRef = false;
+  refCard.hidden = true;
+  overlay.setTargets([], performance.now());
+  updateUi();
+  reprocessStill();
 }
 
-function onStageTap(ev) {
+function onTap(ev) {
   if (!gate.classList.contains('hidden')) return;
-  const rect = overlay.getBoundingClientRect();
-  const x = (ev.touches ? ev.touches[0].clientX : ev.clientX) - rect.left;
-  const y = (ev.touches ? ev.touches[0].clientY : ev.clientY) - rect.top;
-  const { w, h } = { w: rect.width, h: rect.height };
-  const fit = state.source === 'camera' ? 'cover' : 'contain';
-  const mapper = createMapper(state.srcW, state.srcH, w, h, fit);
-  const viewMapper = (state.source === 'camera' && camera.isFront()) ? mirrorMapper(mapper, w) : mapper;
-  if (!state.workW) return;
-  const [wx, wy] = viewMapper.viewToWork(x, y, state.workW, state.workH);
-
+  const lay = state.resultLayout;
+  if (!lay) return;
+  const rect = overlayCanvas.getBoundingClientRect();
+  const [wx, wy] = lay.map.toWork(ev.clientX - rect.left, ev.clientY - rect.top);
   if (state.awaitingSurfaceTap) {
-    processor.sampleSurface(wx, wy);
     state.awaitingSurfaceTap = false;
-    updateSurfaceNote();
-    tracker.reset();
-    processNow();
+    state.pending.surfaceTap = { x: wx, y: wy };
+    $('surface-note').textContent = 'Surface color is locked. Tap Auto Surface to estimate it again.';
+    overlay.clearAll();
     toast('Surface locked');
+    reprocessStill();
     return;
   }
+  state.pending.tap = { x: wx, y: wy };
+  reprocessStill();
+}
 
-  if (state.mode !== 'tap') return;
-  const hit = hitTestSock(state.socks, wx, wy);
-  if (!hit) {
-    state.selected = null;
-    state.matches = [];
-    setChip();
-    return;
-  }
-  state.selected = hit;
-  refreshSelection();
-  setChip();
+function syncTorch() {
+  const ok = state.source === 'camera' && camera.torchSupported();
+  $('btn-torch').hidden = !ok;
+  if (!ok) state.torch = false;
+  $('btn-torch').classList.toggle('active', state.torch);
 }
 
 function bind() {
@@ -375,145 +456,112 @@ function bind() {
   $('btn-demo-gate').addEventListener('click', loadDemo);
   $('btn-upload').addEventListener('click', () => fileInput.click());
   $('btn-upload-gate').addEventListener('click', () => fileInput.click());
-  fileInput.addEventListener('change', () => {
-    const f = fileInput.files && fileInput.files[0];
-    loadImageFile(f);
-    fileInput.value = '';
-  });
+  fileInput.addEventListener('change', () => { loadImageFile(fileInput.files && fileInput.files[0]); fileInput.value = ''; });
 
-  btnFreeze.addEventListener('click', () => {
-    if (state.source !== 'camera') {
-      toast('Freeze is for the live camera');
-      return;
-    }
+  shutter.addEventListener('click', () => {
+    if (state.mode === 'scan') { doScan(); return; }
+    if (state.source !== 'camera') { toast('Freeze is for the live camera'); return; }
     setFrozen(!state.frozen);
-    if (state.frozen) toast('Frozen — boxes stay put while you pick socks up');
+    if (state.frozen) toast('Frozen — outlines stay put while you grab socks');
   });
-
+  $('mode-scan').addEventListener('click', () => setMode('scan'));
   $('mode-pairs').addEventListener('click', () => setMode('pairs'));
-  $('mode-tap').addEventListener('click', () => setMode('tap'));
+  $('btn-clear-ref').addEventListener('click', (e) => { e.stopPropagation(); clearRef(); });
 
   $('btn-torch').addEventListener('click', async () => {
     state.torch = !state.torch;
-    const ok = await camera.setTorch(state.torch);
-    if (!ok) {
-      state.torch = false;
-      toast('Flash is not available on this camera');
-    }
-    syncTorchButton();
+    if (!(await camera.setTorch(state.torch))) { state.torch = false; toast('Flash is not available on this camera'); }
+    syncTorch();
   });
 
   $('btn-settings').addEventListener('click', () => { $('sheet').hidden = false; });
   $('sheet-backdrop').addEventListener('click', () => { $('sheet').hidden = true; });
   $('btn-close-sheet').addEventListener('click', () => { $('sheet').hidden = true; });
-
   const sens = $('sens'), strict = $('strict');
-  const syncSliders = () => {
-    $('sens-val').textContent = String(Math.round(state.sensitivity * 100));
-    $('strict-val').textContent = String(Math.round(state.strictness * 100));
-  };
   sens.addEventListener('input', () => {
     state.sensitivity = Number(sens.value) / 100;
-    syncSliders();
-    tracker.reset();
-    processNow();
+    $('sens-val').textContent = sens.value;
+    vision.reset(!!state.still, false);
+    reprocessStill();
   });
   strict.addEventListener('input', () => {
     state.strictness = Number(strict.value) / 100;
-    syncSliders();
-    processNow();
+    $('strict-val').textContent = strict.value;
+    reprocessStill();
   });
-
   $('btn-lock-surface').addEventListener('click', () => {
     $('sheet').hidden = true;
     state.awaitingSurfaceTap = true;
     toast('Tap the sheet or floor — not a sock');
   });
   $('btn-reset-surface').addEventListener('click', () => {
-    processor.unlockSurface();
     state.awaitingSurfaceTap = false;
-    updateSurfaceNote();
-    tracker.reset();
-    processNow();
+    state.pending.surfaceAuto = true;
+    $('surface-note').textContent = 'Surface color is estimated from the frame.';
+    overlay.clearAll();
     toast('Back to auto surface');
+    reprocessStill();
   });
   $('btn-switch-cam').addEventListener('click', async () => {
     try {
       if (state.source !== 'camera') await startCamera();
-      else {
-        await camera.flip();
-        syncTorchButton();
-        tracker.reset();
-      }
-    } catch {
-      toast('Could not switch camera');
-    }
+      else { await camera.flip(); video.classList.toggle('mirror', camera.isFront()); syncTorch(); resetVision(false); }
+    } catch { toast('Could not switch camera'); }
   });
 
-  overlay.addEventListener('pointerdown', onStageTap);
-
+  overlayCanvas.addEventListener('pointerdown', onTap);
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && state.source === 'camera' && state.torch) {
-      camera.setTorch(false);
-    }
+    if (document.hidden && state.source === 'camera' && state.torch) camera.setTorch(false);
   });
-  window.addEventListener('resize', resizeCanvases);
-  window.addEventListener('orientationchange', () => setTimeout(resizeCanvases, 250));
+  window.addEventListener('resize', measure);
+  window.addEventListener('orientationchange', () => setTimeout(measure, 250));
+}
+
+function nextResult() {
+  return new Promise((resolve) => state.waiters.push(resolve));
 }
 
 function exposeDebug() {
   window.__sockMatcher = {
     getState() {
+      const r = state.result;
+      const lay = state.resultLayout;
       return {
         mode: state.mode,
         source: state.source,
         frozen: state.frozen,
-        socks: state.socks.map((s) => ({
-          index: s.index, trackId: s.trackId, cx: s.cx, cy: s.cy,
-          minX: s.minX, minY: s.minY, maxX: s.maxX, maxY: s.maxY, area: s.area,
-        })),
-        pairs: state.pairs.map((p) => ({ a: p.a, b: p.b, num: p.num, score: p.score })),
-        unmatched: state.unmatched.map((s) => s.index),
-        selected: state.selected ? state.selected.index : null,
-        matches: state.matches.map((m) => ({ index: m.index, score: m.score })),
-        work: { w: state.workW, h: state.workH },
-        src: { w: state.srcW, h: state.srcH },
+        hasRef: state.hasRef,
+        tracks: r ? r.tracks.map((t) => ({ id: t.id, cx: t.cx, cy: t.cy, area: t.area })) : [],
+        pairs: r ? r.pairs.map((p) => ({ a: p.a, b: p.b, slot: p.slot, score: p.ema })) : [],
+        matches: r ? r.matches : [],
+        ref: r ? r.ref : null,
+        work: lay ? { w: lay.w, h: lay.h } : null,
+        rect: lay ? lay.rect : null,
         demoTruth: state.demoTruth,
+        overlayItems: overlay.count(),
+        timing: r ? r.timing : null,
+        perf: perfSummary(),
       };
     },
     loadDemo,
     setMode,
-    tapWork(wx, wy) {
-      const hit = hitTestSock(state.socks, wx, wy);
-      if (hit) {
-        state.selected = hit;
-        refreshSelection();
-        setChip();
-      }
+    nextResult,
+    async tapWork(x, y) {
+      state.pending.tap = { x, y };
+      const p = nextResult();
+      reprocessStill();
+      await p;
       return this.getState();
     },
-    debugMask() {
-      const r = state.lastResult;
-      if (!r) return null;
-      return { w: r.w, h: r.h, threshold: r.threshold, bg: r.bg, blobCount: r.blobs.length, mask: Array.from(r.mask) };
-    },
-    setSliders(sens, strict) {
-      state.sensitivity = sens;
-      state.strictness = strict;
-      $('sens').value = String(Math.round(sens * 100));
-      $('strict').value = String(Math.round(strict * 100));
-      $('sens-val').textContent = String(Math.round(sens * 100));
-      $('strict-val').textContent = String(Math.round(strict * 100));
-      tracker.reset();
-      processNow();
-    },
+    async reprocess() { const p = nextResult(); reprocessStill(); await p; return this.getState(); },
+    allPairs: (s) => vision.allPairs(s ?? state.strictness),
+    perf: perfSummary,
   };
 }
 
 bind();
 exposeDebug();
-requestAnimationFrame(paint);
-
-if (new URLSearchParams(location.search).has('demo')) {
-  loadDemo();
-}
+measure();
+requestAnimationFrame(loop);
+updateUi();
+if (new URLSearchParams(location.search).has('demo')) loadDemo();

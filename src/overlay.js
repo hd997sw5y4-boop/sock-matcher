@@ -1,244 +1,182 @@
-export const PAIR_COLORS = [
-  '#FF3B30', '#0A84FF', '#30D158', '#FFD60A', '#BF5AF2',
-  '#FF9F0A', '#64D2FF', '#FF375F', '#32ADE6', '#00C7BE',
-];
+/**
+ * Overlay renderer. Runs every animation frame, independently of the vision
+ * worker: tracked positions are extrapolated with their velocity and eased,
+ * so outlines stay glued to socks between (slower) vision updates.
+ */
+export const SLOT_COLORS = ['#30D158', '#0A84FF', '#FF9F0A'];
+const MATCH_COLOR = '#30D158';
 
-export function colorForPair(num) {
-  return PAIR_COLORS[(num - 1) % PAIR_COLORS.length];
-}
+export function createOverlay(canvas) {
+  const ctx = canvas.getContext('2d');
+  const items = new Map(); // key -> render item
+  let drewLast = false;
 
-export function createMapper(srcW, srcH, viewW, viewH, fit = 'cover') {
-  const scale = (fit === 'contain' ? Math.min : Math.max)(viewW / srcW, viewH / srcH);
-  const dw = srcW * scale, dh = srcH * scale;
-  const ox = (viewW - dw) / 2, oy = (viewH - dh) / 2;
-  return {
-    scale, ox, oy,
-    srcToView(x, y) { return [x * scale + ox, y * scale + oy]; },
-    viewToSrc(x, y) { return [(x - ox) / scale, (y - oy) / scale]; },
-    workToView(x, y, workW, workH) {
-      return this.srcToView(x * (srcW / workW), y * (srcH / workH));
-    },
-    viewToWork(x, y, workW, workH) {
-      const [sx, sy] = this.viewToSrc(x, y);
-      return [sx * (workW / srcW), sy * (workH / srcH)];
-    },
-  };
-}
-
-export function drawDisplayFrame(ctx, source, viewW, viewH, srcW, srcH, mirror = false, fit = 'cover') {
-  ctx.save();
-  ctx.fillStyle = '#111';
-  ctx.fillRect(0, 0, viewW, viewH);
-  const scale = (fit === 'contain' ? Math.min : Math.max)(viewW / srcW, viewH / srcH);
-  const dw = srcW * scale, dh = srcH * scale;
-  const ox = (viewW - dw) / 2, oy = (viewH - dh) / 2;
-  if (mirror) {
-    ctx.translate(viewW, 0);
-    ctx.scale(-1, 1);
-    ctx.drawImage(source, viewW - (ox + dw), oy, dw, dh);
-  } else {
-    ctx.drawImage(source, ox, oy, dw, dh);
-  }
-  ctx.restore();
-}
-
-export function renderOverlay(ctx, state, t) {
-  const { viewW, viewH, dpr, mapper, workW, workH, mode, socks, pairs, unmatched, selected, matches, frozen } = state;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, viewW, viewH);
-
-  if (!socks || !socks.length) return;
-
-  const toView = (pt) => mapper.workToView(pt[0], pt[1], workW, workH);
-
-  if (mode === 'tap' && selected) {
-    // Dim the whole frame, punch socks later by drawing them on top of a veil.
-    ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    ctx.fillRect(0, 0, viewW, viewH);
-  }
-
-  const pairOf = new Map();
-  for (const p of pairs) {
-    pairOf.set(p.a, p);
-    pairOf.set(p.b, p);
-  }
-
-  const pulse = 0.5 + 0.5 * Math.sin(t * 0.006);
-
-  for (const sock of socks) {
-    const pair = pairOf.get(sock.index);
-    const isSel = selected && selected.index === sock.index;
-    const matchInfo = matches?.find((m) => m.index === sock.index);
-    const isMatch = !!matchInfo;
-    const dim = mode === 'tap' && selected && !isSel && !isMatch;
-
-    let color = '#d4d4d8';
-    let width = 2.4;
-    let dashed = false;
-    let fillA = 0.14;
-
-    if (mode === 'pairs') {
-      if (pair) {
-        color = colorForPair(pair.num);
-        width = 3;
-        fillA = 0.18;
-      } else {
-        color = 'rgba(255,255,255,0.7)';
-        dashed = true;
-        width = 2;
-        fillA = 0.06;
+  /**
+   * targets: [{key, id, color, label, kind:'match'|'pair'|'ref', track}]
+   * map: {toView(x,y) -> [vx,vy], scale}
+   */
+  function setTargets(targets, resultTime) {
+    const keep = new Set();
+    for (const t of targets) {
+      keep.add(t.key);
+      let it = items.get(t.key);
+      if (!it) {
+        it = { key: t.key, x: null, y: null, alpha: 0, dying: false };
+        items.set(t.key, it);
       }
-    } else if (mode === 'tap') {
-      if (isSel) {
-        color = '#ffffff';
-        width = 4;
-        fillA = 0.16;
-      } else if (isMatch) {
-        color = '#30D158';
-        width = 3.5 + pulse * 1.5;
-        fillA = 0.22 + pulse * 0.12;
-      } else {
-        color = 'rgba(255,255,255,0.28)';
-        width = 1.5;
-        fillA = 0.04;
-      }
+      it.dying = false;
+      it.track = t.track;
+      it.color = t.color;
+      it.label = t.label;
+      it.kind = t.kind;
+      it.t0 = resultTime;
+      if (t.track.outline) it.outline = t.track.outline;
     }
-
-    if (dim) fillA *= 0.3;
-
-    const contour = sock.contour?.map(toView) || boxContour(sock, toView);
-    drawContour(ctx, contour, color, width, fillA, dashed);
+    for (const it of items.values()) if (!keep.has(it.key)) it.dying = true;
   }
 
-  // Badges
-  if (mode === 'pairs') {
-    for (const p of pairs) {
-      const color = colorForPair(p.num);
-      const sa = socks[p.a], sb = socks[p.b];
-      if (sa) drawBadge(ctx, ...toView([sa.cx, sa.cy]), String(p.num), color);
-      if (sb) drawBadge(ctx, ...toView([sb.cx, sb.cy]), String(p.num), color);
+  function clearAll() { items.clear(); }
+
+  function render(now, dt, view, map, extra) {
+    const { w, h, dpr } = view;
+    if (!items.size && !extra?.target && !drewLast) return 0;
+    const t0 = performance.now();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    drewLast = false;
+    if (extra?.target) { drawTarget(extra.target, now); drewLast = true; }
+    const ease = 1 - Math.exp(-dt / 55);
+    for (const it of [...items.values()]) {
+      it.alpha += (it.dying ? -1 : 1) * dt / 160;
+      if (it.alpha <= 0 && it.dying) { items.delete(it.key); continue; }
+      it.alpha = Math.min(1, Math.max(0, it.alpha));
+      const tr = it.track;
+      // Predict where the sock is now from its velocity (capped).
+      const lead = Math.min(140, Math.max(0, now - it.t0));
+      const px = tr.cx + (tr.vx || 0) * lead, py = tr.cy + (tr.vy || 0) * lead;
+      const [tx, ty] = map.toView(px, py);
+      if (it.x === null) { it.x = tx; it.y = ty; } else { it.x += (tx - it.x) * ease; it.y += (ty - it.y) * ease; }
+      drawItem(it, map.scale, map.mirror, now);
+      drewLast = true;
     }
-    for (const s of unmatched) {
-      const [x, y] = toView([s.cx, s.minY - 4]);
-      drawTiny(ctx, x, y, 'solo', 'rgba(24,24,28,0.82)', '#fff');
+    return performance.now() - t0;
+  }
+
+  function drawItem(it, scale, mirror, now) {
+    const o = it.outline;
+    if (!o) return;
+    ctx.save();
+    ctx.globalAlpha = it.alpha;
+    ctx.beginPath();
+    const sx = mirror ? -scale : scale;
+    let topY = Infinity, topX = it.x;
+    for (let k = 0; k < o.length; k += 2) {
+      const x = it.x + o[k] * sx, y = it.y + o[k + 1] * scale;
+      if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      if (y < topY) { topY = y; topX = x; }
     }
-  } else if (mode === 'tap' && selected) {
-    const [sx, sy] = toView([selected.cx, selected.minY - 6]);
-    drawTiny(ctx, sx, sy, 'this sock', '#fff', '#111');
-    if (!matches?.length) {
-      const [x, y] = toView([selected.cx, selected.maxY + 16]);
-      drawTiny(ctx, x, y, 'no clear match', 'rgba(24,24,28,0.9)', '#fff');
+    ctx.closePath();
+    const c = it.color;
+    if (it.kind === 'ref') {
+      ctx.setLineDash([6, 6]);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+      ctx.stroke();
+      ctx.restore();
+      pill(it.x, topY - 12, 'scanned', 'rgba(255,255,255,0.92)', '#111', it.alpha);
+      return;
     }
-    for (const m of matches || []) {
-      const sock = socks[m.index];
-      if (!sock) continue;
-      const [x, y] = toView([sock.cx, sock.minY - 6]);
-      const label = `${Math.round(m.score * 100)}%`;
-      drawBadge(ctx, x, y, label, '#30D158', 22);
+    const pulse = 0.5 + 0.5 * Math.sin(now * 0.005);
+    ctx.fillStyle = rgba(c, 0.16 + 0.06 * pulse);
+    ctx.fill();
+    // Glow without shadowBlur (cheap on Safari): wide translucent strokes.
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = rgba(c, 0.18);
+    ctx.lineWidth = 14;
+    ctx.stroke();
+    ctx.strokeStyle = rgba(c, 0.35 + 0.15 * pulse);
+    ctx.lineWidth = 7;
+    ctx.stroke();
+    ctx.strokeStyle = c;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.restore();
+    if (it.label) {
+      if (it.kind === 'pair') badge(it.x, it.y, it.label, c, it.alpha);
+      else pill(it.x, Math.max(14, topY - 14), it.label, c, '#06240f', it.alpha);
     }
   }
 
-  if (frozen) {
-    ctx.fillStyle = 'rgba(10,132,255,0.12)';
-    ctx.fillRect(0, 0, viewW, 0); // no-op reserved
+  function drawTarget(t, now) {
+    const { x, y, w, h } = t;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = 3;
+    const L = Math.min(w, h) * 0.22;
+    ctx.beginPath();
+    // Corner brackets.
+    ctx.moveTo(x, y + L); ctx.lineTo(x, y); ctx.lineTo(x + L, y);
+    ctx.moveTo(x + w - L, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + L);
+    ctx.moveTo(x + w, y + h - L); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w - L, y + h);
+    ctx.moveTo(x + L, y + h); ctx.lineTo(x, y + h); ctx.lineTo(x, y + h - L);
+    ctx.stroke();
+    ctx.restore();
+    pill(x + w / 2, y + h + 18, 'Put one sock here, tap Scan', 'rgba(20,20,24,0.8)', '#fff', 1);
   }
-}
 
-function boxContour(sock, toView) {
-  return [
-    toView([sock.minX, sock.minY]),
-    toView([sock.maxX, sock.minY]),
-    toView([sock.maxX, sock.maxY]),
-    toView([sock.minX, sock.maxY]),
-  ];
-}
-
-function drawContour(ctx, pts, color, width, fillA, dashed) {
-  if (!pts || pts.length < 3) return;
-  ctx.beginPath();
-  ctx.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
-  ctx.closePath();
-  ctx.fillStyle = hexAlpha(color, fillA);
-  ctx.fill();
-  ctx.lineWidth = width;
-  ctx.strokeStyle = color;
-  ctx.setLineDash(dashed ? [6, 5] : []);
-  ctx.lineJoin = 'round';
-  ctx.lineCap = 'round';
-  ctx.stroke();
-  ctx.setLineDash([]);
-}
-
-function drawBadge(ctx, x, y, text, color, r = 15) {
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fillStyle = color;
-  ctx.fill();
-  ctx.lineWidth = 2;
-  ctx.strokeStyle = 'rgba(0,0,0,0.25)';
-  ctx.stroke();
-  ctx.fillStyle = contrastInk(color);
-  ctx.font = `700 ${text.length > 2 ? 11 : 14}px -apple-system, BlinkMacSystemFont, sans-serif`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, x, y + 0.5);
-}
-
-function drawTiny(ctx, x, y, text, bg, fg) {
-  ctx.font = '700 11px -apple-system, BlinkMacSystemFont, sans-serif';
-  const tw = ctx.measureText(text).width;
-  const pad = 7;
-  const h = 18;
-  const w = tw + pad * 2;
-  roundRect(ctx, x - w / 2, y - h / 2, w, h, 9);
-  ctx.fillStyle = bg;
-  ctx.fill();
-  ctx.fillStyle = fg;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, x, y + 0.5);
-}
-
-function roundRect(ctx, x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
-}
-
-function hexAlpha(color, a) {
-  if (color.startsWith('rgba') || color.startsWith('rgb')) {
-    return color.replace(/rgba?\(([^)]+)\)/, (_, inner) => {
-      const parts = inner.split(',').map((s) => s.trim());
-      return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${a})`;
-    });
+  function badge(x, y, text, color, alpha) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.arc(x, y, 15, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = '800 15px -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, x, y + 0.5);
+    ctx.restore();
   }
-  const h = color.replace('#', '');
-  const n = parseInt(h.length === 3 ? h.split('').map((c) => c + c).join('') : h, 16);
-  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
-  return `rgba(${r}, ${g}, ${b}, ${a})`;
-}
 
-function contrastInk(color) {
-  if (!color.startsWith('#')) return '#111';
-  const h = color.slice(1);
-  const n = parseInt(h, 16);
-  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
-  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  return lum > 170 ? '#111' : '#fff';
-}
-
-export function hitTestSock(socks, workX, workY) {
-  let best = null, bestD = Infinity;
-  for (const s of socks) {
-    const pad = 8;
-    if (workX < s.minX - pad || workX > s.maxX + pad || workY < s.minY - pad || workY > s.maxY + pad) continue;
-    const d = Math.hypot(workX - s.cx, workY - s.cy);
-    if (d < bestD) { bestD = d; best = s; }
+  function pill(x, y, text, bg, fg, alpha) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.font = '800 13px -apple-system, BlinkMacSystemFont, sans-serif';
+    const tw = ctx.measureText(text).width;
+    const pw = tw + 16, ph = 22;
+    const rx = x - pw / 2, ry = y - ph / 2;
+    ctx.beginPath();
+    ctx.moveTo(rx + 11, ry);
+    ctx.arcTo(rx + pw, ry, rx + pw, ry + ph, 11);
+    ctx.arcTo(rx + pw, ry + ph, rx, ry + ph, 11);
+    ctx.arcTo(rx, ry + ph, rx, ry, 11);
+    ctx.arcTo(rx, ry, rx + pw, ry, 11);
+    ctx.closePath();
+    ctx.fillStyle = bg;
+    ctx.fill();
+    ctx.fillStyle = fg;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, x, y + 0.5);
+    ctx.restore();
   }
-  return best;
+
+  return { setTargets, render, clearAll, count: () => items.size };
 }
+
+const rgbCache = new Map();
+function rgba(hex, a) {
+  let rgb = rgbCache.get(hex);
+  if (!rgb) {
+    const n = parseInt(hex.slice(1), 16);
+    rgb = `${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}`;
+    rgbCache.set(hex, rgb);
+  }
+  return `rgba(${rgb}, ${a.toFixed(3)})`;
+}
+
+export { MATCH_COLOR };

@@ -44,8 +44,8 @@
           <i class="s s1"></i><i class="s s2"></i><i class="s s3"></i>
         </div>
         <h1>Find the pairs.</h1>
-        <p>Spread your socks on a bed or floor, then point the camera. Matching pairs light up with the same color and number.</p>
-        <p class="tip">Tip: spread them out on a plain surface for best results.</p>
+        <p>Scan one sock, then point at the pile. Its match lights up live.</p>
+        <p class="tip">Tip: spread socks out a little so they don’t overlap.</p>
         <button id="btn-camera" class="primary" type="button">Enable Camera</button>
         <div class="gate-row">
           <button id="btn-demo-gate" class="secondary" type="button">Try Demo Pile</button>
@@ -54,16 +54,23 @@
       </div>
     </div>
 
+    <div id="ref-card" hidden>
+      <canvas id="ref-thumb" width="112" height="112" aria-label="Scanned sock"></canvas>
+      <button id="btn-clear-ref" type="button" aria-label="Clear scanned sock">✕</button>
+    </div>
+
+    <div id="perf-hud" hidden></div>
+
     <div id="toast" hidden></div>
 
     <footer id="dock">
-      <button id="btn-freeze" class="shutter" type="button" aria-label="Freeze frame">
+      <button id="btn-shutter" class="shutter" type="button" aria-label="Scan">
         <span class="shutter-ring"></span>
-        <span class="shutter-label">Freeze</span>
+        <span class="shutter-label">Scan</span>
       </button>
       <div id="mode-toggle" class="pills" role="tablist" aria-label="Matching mode">
-        <button id="mode-pairs" class="pill active" type="button" role="tab" aria-selected="true">Auto Pairs</button>
-        <button id="mode-tap" class="pill" type="button" role="tab" aria-selected="false">Tap to Match</button>
+        <button id="mode-scan" class="pill active" type="button" role="tab" aria-selected="true">Scan a Sock</button>
+        <button id="mode-pairs" class="pill" type="button" role="tab" aria-selected="false">Auto Pairs</button>
       </div>
     </footer>
 
@@ -86,7 +93,7 @@
             <span id="strict-val">55</span>
           </div>
           <input id="strict" type="range" min="0" max="100" value="55" />
-          <small>Turn up for look-alike socks. Turn down if real pairs are being skipped.</small>
+          <small>Turn up if wrong socks light up. Turn down if real matches are missed.</small>
         </label>
         <div class="sheet-actions">
           <button id="btn-lock-surface" class="secondary" type="button">Set Surface</button>

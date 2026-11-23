@@ -11,17 +11,17 @@ A fast, mobile-first web app that finds matching socks from your phone camera. I
 
 ### Modes
 
-- **Auto Pairs** — every sock is outlined. Matching pairs share a color and a number (`1`, `2`, `3`…). Leftovers get a small “solo” badge.
-- **Tap to Match** — tap one sock. Everything else dims, and its best match pulses with a match percentage.
-- **Freeze** — on live camera, freeze the frame so the boxes stay put while you pick socks up.
-- **Photo** — snap a picture or pick one from your Camera Roll if you’d rather not use the live camera.
-- **Set Surface** (in Settings) — tap the sheet or floor if the background is busy. Drag **Detection sensitivity** and **Match strictness** if the pile is tricky.
+- **Scan a Sock** (default) — put one sock in the center box (or hold it up) and tap **Scan**, or just tap a sock on screen. A thumbnail of it sits in the corner, and the live camera outlines only its best 1–3 matches with a match %.
+- **Auto Pairs** — finds the pairs it is most confident about and shows at most 3 at a time. Unmatched socks get no overlay. **Freeze** holds the outlines still while you grab socks.
+- **Photo** / **Demo** — run the same matching on a still picture.
+- **Settings** — detection sensitivity, match strictness, and **Set Surface** for a tricky bedspread.
 
-## Honest limits
+## How it works (no AI)
 
-- Plain identical black or white socks look almost the same to a camera, so the app can’t reliably tell one pair from another.
-- Heavily overlapping piles may be read as one blob. Spread socks out with a little space between them.
-- A very patterned bedspread can confuse detection — use **Set Surface** or a plainer background.
+- The camera preview is the native `<video>`; vision runs in a Web Worker on a ~90k-pixel copy of the visible area, about 15 times a second. Outlines are drawn every frame on their own canvas and follow each sock using its tracked velocity, so the preview never waits on the matching.
+- Surface model: dominant chroma plus per-cell lightness of the bed or floor, so wrinkles and soft shadows aren't socks. Touching socks are split by color-aware region growing.
+- Descriptor per sock (cached per tracked sock): gray-world white balance, soft a*b* and lightness histograms, 3 dominant colors, 5 color bands along the sock's long axis (cuff → toe, either direction), gradient orientation relative to the axis, edge density, and stripe frequency.
+- Matches must persist over several frames (hysteresis) before they light up, which keeps outlines steady.
 
 ## Develop
 

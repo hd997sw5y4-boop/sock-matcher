@@ -1,147 +1,96 @@
-import { histogramIntersection, labDist } from './color.js';
-import { paletteDistance } from './describe.js';
+/** Similarity between two sock descriptors, 0..1. */
 
-export function descriptorSimilarity(a, b) {
-  const h = histogramIntersection(a.histH, b.histH);
-  const s = histogramIntersection(a.histS, b.histS);
-  const l = histogramIntersection(a.histL, b.histL);
-  const ab = histogramIntersection(a.histAB, b.histAB);
-  const meanD = labDist(a.mean[0], a.mean[1], a.mean[2], b.mean[0], b.mean[1], b.mean[2]);
-  const meanScore = Math.max(0, 1 - meanD / 55);
-  const pal = Math.max(0, 1 - paletteDistance(a.palette, b.palette) / 45);
-  const edge = 1 - Math.min(1, Math.abs(a.edgeDensity - b.edgeDensity) / 0.28);
-  const gvar = 1 - Math.min(1, Math.abs(Math.sqrt(a.gradVar) - Math.sqrt(b.gradVar)) / 18);
-  const orient = histogramIntersection(a.orient, b.orient);
-  const aspect = 1 - Math.min(1, Math.abs(a.aspect - b.aspect) / 2.4);
-  const area = 1 - Math.min(1, Math.abs(a.area - b.area) / Math.max(a.area, b.area, 1));
-
-  // Color dominates; texture catches stripes vs solids vs dots; shape is mild.
-  const color = 0.22 * h + 0.10 * s + 0.10 * l + 0.22 * ab + 0.10 * meanScore + 0.12 * pal;
-  const texture = 0.06 * edge + 0.04 * gvar + 0.04 * orient;
-  const shape = 0.03 * aspect + 0.02 * area;
-  return Math.max(0, Math.min(1, (color + texture + shape) / 1.05));
+function bhatt(p, q) {
+  let s = 0;
+  for (let i = 0; i < p.length; i++) s += Math.sqrt(p[i] * q[i]);
+  return Math.min(1, s);
 }
 
-export function similarityMatrix(descs) {
-  const n = descs.length;
-  const m = Array.from({ length: n }, () => new Float32Array(n));
-  for (let i = 0; i < n; i++) {
-    m[i][i] = 1;
-    for (let j = i + 1; j < n; j++) {
-      const s = descriptorSimilarity(descs[i], descs[j]);
-      m[i][j] = s;
-      m[j][i] = s;
+function cdist(l1, a1, b1, l2, a2, b2) {
+  const dl = (l1 - l2) * 0.55, da = a1 - a2, db = b1 - b2;
+  return Math.sqrt(dl * dl + da * da + db * db);
+}
+
+function palDist(p, q) {
+  const one = (x, y) => {
+    let s = 0, tw = 0;
+    for (const c of x) {
+      let best = 1e9;
+      for (const d of y) best = Math.min(best, cdist(c.L, c.a, c.b, d.L, d.a, d.b));
+      s += best * c.w; tw += c.w;
     }
+    return s / (tw || 1);
+  };
+  return 0.5 * (one(p, q) + one(q, p));
+}
+
+function bandDist(x, y) {
+  let f = 0, r = 0;
+  const n = x.length / 3;
+  for (let i = 0; i < n; i++) {
+    const j = n - 1 - i;
+    f += cdist(x[i * 3], x[i * 3 + 1], x[i * 3 + 2], y[i * 3], y[i * 3 + 1], y[i * 3 + 2]);
+    r += cdist(x[i * 3], x[i * 3 + 1], x[i * 3 + 2], y[j * 3], y[j * 3 + 1], y[j * 3 + 2]);
   }
-  return m;
+  return Math.min(f, r) / n;
+}
+
+export function similarity(a, b) {
+  const sAB = bhatt(a.ab, b.ab);
+  const sL = bhatt(a.lh, b.lh);
+  const sPal = Math.exp(-palDist(a.pal, b.pal) / 14);
+  const sMean = Math.exp(-cdist(a.mean[0], a.mean[1], a.mean[2], b.mean[0], b.mean[1], b.mean[2]) / 10);
+  const sBand = Math.exp(-bandDist(a.bands, b.bands) / 16);
+  const sOri = bhatt(a.ori, b.ori);
+  const sEdge = Math.exp(-Math.abs(a.edge - b.edge) / 0.09);
+  const sStripe = Math.exp(-Math.abs(a.stripes - b.stripes) / 3);
+  const tex = 0.4 * sEdge + 0.35 * sOri + 0.25 * sStripe;
+  const areaR = Math.min(a.area, b.area) / Math.max(a.area, b.area, 1);
+  const elR = Math.min(a.elong, b.elong) / Math.max(a.elong, b.elong, 1);
+  const shape = 0.7 + 0.3 * elR;
+  // Weighted geometric mean so one strongly disagreeing cue vetoes a match.
+  const s = Math.exp(
+    0.24 * Math.log(sAB + 1e-4)
+    + 0.18 * Math.log(sPal + 1e-4)
+    + 0.16 * Math.log(sMean + 1e-4)
+    + 0.14 * Math.log(sBand + 1e-4)
+    + 0.06 * Math.log(sL + 1e-4)
+    + 0.16 * Math.log(tex + 1e-4)
+    + 0.06 * Math.log(shape),
+  );
+  // Mates show a similar visible size; a held-up scan is at another scale.
+  const sizeF = a.held || b.held ? 1 : Math.min(1, 0.55 + areaR);
+  return s * sizeF;
+}
+
+/** strictness 0..1 -> similarity threshold. */
+export function thresholdFor(strictness) {
+  return 0.46 + strictness * 0.3; // default 0.55 -> 0.625
 }
 
 /**
- * Pair socks. `strictness` is 0..1, mapped to a similarity threshold.
- * Returns { pairs: [{a,b,score}], unmatched: number[] }
+ * Confident pairs: mutual best matches above threshold that also beat each
+ * one's runner-up by a margin. Returns sorted by score (best first).
  */
-export function pairSocks(descs, strictness = 0.55) {
-  const n = descs.length;
-  if (n < 2) return { pairs: [], unmatched: n === 1 ? [0] : [] };
-  const sim = similarityMatrix(descs);
-  const threshold = 0.42 + strictness * 0.36; // 0.42 .. 0.78
-  const pairs = hungarianPairs(sim, threshold);
-  const used = new Set();
-  for (const p of pairs) { used.add(p.a); used.add(p.b); }
-  const unmatched = [];
-  for (let i = 0; i < n; i++) if (!used.has(i)) unmatched.push(i);
-  return { pairs, unmatched, sim, threshold };
-}
-
-/** Min-cost assignment with an optional dummy for an odd leftover. */
-function hungarianPairs(sim, threshold) {
-  const n = sim.length;
-  const useDummy = n % 2 === 1;
-  const dim = n + (useDummy ? 1 : 0);
-  const INF = 1e6;
-  const cost = Array.from({ length: dim }, () => new Float64Array(dim));
-  for (let i = 0; i < dim; i++) {
-    for (let j = 0; j < dim; j++) {
-      if (i === j) { cost[i][j] = INF; continue; }
-      if (useDummy && (i === n || j === n)) {
-        cost[i][j] = 1 - (threshold - 0.02);
-        continue;
-      }
-      const s = sim[i][j];
-      cost[i][j] = s >= threshold ? 1 - s : INF;
+export function confidentPairs(ids, sim, threshold, margin = 0.02) {
+  const n = ids.length;
+  const best = new Int32Array(n).fill(-1), bestS = new Float32Array(n), second = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      if (i === j) continue;
+      const s = sim[i * n + j];
+      if (s > bestS[i]) { second[i] = bestS[i]; bestS[i] = s; best[i] = j; } else if (s > second[i]) second[i] = s;
     }
   }
-  const match = hungarian(cost);
-  const pairs = [];
-  const seen = new Set();
+  const out = [];
   for (let i = 0; i < n; i++) {
-    const j = match[i];
-    if (j < 0 || j >= n || seen.has(i) || seen.has(j)) continue;
-    const s = sim[i][j];
+    const j = best[i];
+    if (j <= i || best[j] !== i) continue;
+    const s = bestS[i];
     if (s < threshold) continue;
-    pairs.push({ a: Math.min(i, j), b: Math.max(i, j), score: s });
-    seen.add(i); seen.add(j);
+    const m = Math.min(s - second[i], s - second[j]);
+    if (m < margin) continue;
+    out.push({ a: ids[i], b: ids[j], score: s, margin: m });
   }
-  pairs.sort((p, q) => q.score - p.score);
-  return pairs;
-}
-
-/**
- * Hungarian / Kuhn-Munkres for square cost matrices. Returns col-for-row assignment.
- * Compact O(n^3) implementation.
- */
-export function hungarian(cost) {
-  const n = cost.length;
-  const u = new Float64Array(n + 1);
-  const v = new Float64Array(n + 1);
-  const p = new Int32Array(n + 1);
-  const way = new Int32Array(n + 1);
-  const minv = new Float64Array(n + 1);
-  const used = new Uint8Array(n + 1);
-
-  for (let i = 1; i <= n; i++) {
-    p[0] = i;
-    let j0 = 0;
-    minv.fill(1e15);
-    used.fill(0);
-    do {
-      used[j0] = 1;
-      const i0 = p[j0];
-      let delta = 1e15;
-      let j1 = 0;
-      for (let j = 1; j <= n; j++) {
-        if (used[j]) continue;
-        const cur = cost[i0 - 1][j - 1] - u[i0] - v[j];
-        if (cur < minv[j]) {
-          minv[j] = cur;
-          way[j] = j0;
-        }
-        if (minv[j] < delta) {
-          delta = minv[j];
-          j1 = j;
-        }
-      }
-      for (let j = 0; j <= n; j++) {
-        if (used[j]) {
-          u[p[j]] += delta;
-          v[j] -= delta;
-        } else {
-          minv[j] -= delta;
-        }
-      }
-      j0 = j1;
-    } while (p[j0] !== 0);
-    do {
-      const j1 = way[j0];
-      p[j0] = p[j1];
-      j0 = j1;
-    } while (j0);
-  }
-
-  const assignment = new Int32Array(n);
-  assignment.fill(-1);
-  for (let j = 1; j <= n; j++) {
-    if (p[j]) assignment[p[j] - 1] = j - 1;
-  }
-  return assignment;
+  return out.sort((p, q) => q.score - p.score);
 }
