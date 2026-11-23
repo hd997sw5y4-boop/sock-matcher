@@ -6,7 +6,8 @@
  *  - bands: 5 mean-Lab bands along the sock's long axis (cuff..toe)
  *  - ori: gradient orientation histogram relative to the long axis
  *  - edge / stripes: texture density and stripe frequency along the axis
- *  - shape: elongation + area
+ * Scan matching uses only appearance (histograms, palette, texture). Area and
+ * elongation stay on the descriptor for Auto Pairs, not for Scan.
  */
 const AB_B = 8, AB_LO = -40, AB_SPAN = 80;
 const L_B = 8;

@@ -13,7 +13,7 @@ A fast, mobile-first web app that finds matching socks from your phone camera. I
 
 ### Modes
 
-- **Scan a Sock** (default) — tap a sock in the live view, or put one in the center box and tap **Scan**. A thumbnail sits in the corner, and the camera outlines only its best 1–3 matches, with a confidence %. If the model isn’t sure, classic color matches still show.
+- **Scan a Sock** (default) — tap a sock in the live view, or put one in the center box and tap **Scan**. The app remembers that sock’s appearance (color, stripes/texture, and the pattern embedding if it’s loaded) until you tap ✕ or scan again, including if you switch away from the tab. The camera then outlines the best 1–3 appearance matches — any size or shape, including bunched or partial socks. Size and outline are not part of the score.
 - **Auto Pairs** — finds the pairs it is most confident about and shows at most 3 at a time. Unmatched socks get no overlay. **Freeze** holds the outlines still while you grab socks.
 - **Color Sort** — pick a color chip (pink, white, grey, black, blue, green, purple, red, yellow, multi/striped, or tap a sock to pick a color). The camera outlines every sock of that color, with a count, so you can pull a huge pile into smaller ones first. This uses a lightweight color check on the same low-resolution, battery-saver camera path — no 1–3 cap, and the pattern model is not used.
 - **Photo** / **Demo** — run the same matching on a still picture.

@@ -5,7 +5,7 @@
 import { rgbaToLabPlanes, blur3 } from './lab.js';
 import { createSegmenter } from './segment.js';
 import { describeRegion } from './describe.js';
-import { similarity, thresholdFor, confidentPairs } from './match.js';
+import { similarity, appearanceSimilarity, appearanceOf, thresholdFor, confidentPairs } from './match.js';
 import { collectColorHits, pickColorAt } from './colorClass.js';
 
 export const MAX_SHOWN = 3;
@@ -66,7 +66,7 @@ export function createEngine() {
 
   function refSim(t) {
     if (t.refV === refVersion && t.refDv === t.dv) return t.refS;
-    t.refS = similarity(ref.desc, t.desc);
+    t.refS = appearanceSimilarity(ref.desc, t.desc);
     t.refV = refVersion; t.refDv = t.dv;
     return t.refS;
   }
@@ -250,11 +250,14 @@ export function createEngine() {
     if (o.refMask) scan = refFromMask(o.refMask, o.excludeId);
     if (o.tap) scan = refFromTap(o.tap);
     if (o.scanBox) scan = refFromBox(o.scanBox, refL);
+    if (scan && scan.ok && ref) scan.appearance = appearanceOf(ref.desc);
 
     const thr = thresholdFor(o.strictness ?? 0.55);
     const minHits = o.still ? 1 : 3;
-    // Candidates: real-sized socks inside the visible area (not under the
-    // toolbars) and not a big blob running off the frame edge (floor, rug).
+    const scanMode = (o.mode || 'scan') === 'scan';
+    // Auto Pairs still ignores tiny crumbs and huge edge blobs. Scan mode
+    // scores any current region by appearance — including smaller, partial,
+    // or bunched socks — and does not gate on area relative to the scan.
     const areas = [...tracks.values()].map((x) => x.area).sort((a, b) => a - b);
     const medA = areas.length ? areas[areas.length >> 1] : 0;
     const minA = Math.max(n * 0.003, medA * 0.3);
@@ -265,7 +268,7 @@ export function createEngine() {
       // shown lock via match/pair hold, without refreshing lastHit.
       if (x.missed > 0) return false;
       if (x.hits < minHits && !sticky) return false;
-      if (x.area < minA && !sticky) return false;
+      if (!scanMode && x.area < minA && !sticky) return false;
       if (!sticky && (x.cy < y0 || x.cy > y1 || x.edge)) return false;
       return true;
     });
@@ -295,9 +298,19 @@ export function createEngine() {
   }
 
   function setRef(desc, excludeId) {
-    ref = { desc, excludeId };
+    ref = { desc: appearanceOf(desc), excludeId };
     refVersion++;
     matchState = new Map();
+  }
+
+  function setAppearance(desc, excludeId) {
+    if (!desc) return { ok: false };
+    setRef(desc, excludeId || 0);
+    return { ok: true };
+  }
+
+  function getAppearance() {
+    return ref ? { desc: appearanceOf(ref.desc), excludeId: ref.excludeId || 0 } : null;
   }
 
   /** Build a reference descriptor from a binary mask (row-major, 1 = sock). */
@@ -563,5 +576,5 @@ export function createEngine() {
     return a && b ? sim(a, b) : 0;
   }
 
-  return { process, reset, clearRef, allPairs, simBetween, getTracks: () => tracks, hasRef: () => !!ref, setRefFromMask: (mask, excludeId) => refFromMask(mask, excludeId) };
+  return { process, reset, clearRef, allPairs, simBetween, getTracks: () => tracks, hasRef: () => !!ref, setRefFromMask: (mask, excludeId) => refFromMask(mask, excludeId), setAppearance, getAppearance };
 }

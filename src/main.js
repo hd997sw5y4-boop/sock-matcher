@@ -4,6 +4,7 @@ import { generateDemoPile } from './demo.js';
 import { createOverlay, SLOT_COLORS, MATCH_COLOR } from './overlay.js';
 import { createMlClient } from './ml/client.js';
 import { COLOR_CHIPS, chipTint } from './cv/colorClass.js';
+import { serializeAppearance, parseAppearance } from './cv/match.js';
 
 const $ = (id) => document.getElementById(id);
 const video = $('video');
@@ -35,6 +36,7 @@ const ML_INTERVAL_SAVER = 700;  // ~1.4 Hz embeddings, a few crops only
 const ML_INTERVAL_PERF = 500;   // ~2 Hz
 const MAX_ML_CROPS = 6;
 const SAVER_KEY = 'sock-matcher-battery-saver';
+const SCAN_KEY = 'sock-matcher-scan';
 
 function readBatterySaver() {
   try {
@@ -380,6 +382,7 @@ function onScanResult(res, lay) {
   refCard.hidden = false;
   if (state.mode !== 'scan') setMode('scan', true);
   toast('Scanned — now point at the pile');
+  if (res.scan.appearance) persistScan({ desc: res.scan.appearance, excludeId: res.scan.id });
   requestRefEmbed(res, lay);
 }
 
@@ -476,6 +479,61 @@ function perfText() {
     + `grab ${p.grab.avg.toFixed(1)}ms overlay ${p.overlay.avg.toFixed(2)}ms`;
 }
 
+
+function persistScan(patch) {
+  try {
+    const cur = JSON.parse(sessionStorage.getItem(SCAN_KEY) || '{}');
+    if (patch.desc) patch.desc = serializeAppearance(patch.desc);
+    if (patch.embedding && patch.embedding.length) patch.embedding = Array.from(patch.embedding);
+    let thumb = cur.thumb;
+    try { thumb = refThumb.toDataURL('image/jpeg', 0.72); } catch { /* ignore */ }
+    sessionStorage.setItem(SCAN_KEY, JSON.stringify({ ...cur, ...patch, thumb, savedAt: Date.now() }));
+  } catch { /* private mode / quota */ }
+}
+
+function forgetScan() {
+  try { sessionStorage.removeItem(SCAN_KEY); } catch { /* ignore */ }
+}
+
+function readSavedScan() {
+  try {
+    const raw = sessionStorage.getItem(SCAN_KEY);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    return o && o.desc ? o : null;
+  } catch { return null; }
+}
+
+async function ensureScanInEngine() {
+  const saved = readSavedScan();
+  if (!saved) return false;
+  const cur = await vision.getAppearance();
+  if (!cur || !cur.desc) {
+    const desc = parseAppearance(saved.desc);
+    if (desc) await vision.setAppearance(desc, saved.excludeId);
+  }
+  if (saved.embedding && !ml.getState()?.error) {
+    startMl();
+    await ml.setRefEmbedding(saved.embedding);
+  }
+  if (saved.thumb && !state.hasRef) {
+    try {
+      const img = new Image();
+      await new Promise((resolve) => { img.onload = resolve; img.onerror = resolve; img.src = saved.thumb; });
+      if (img.width) {
+        const ctx = refThumb.getContext('2d');
+        ctx.fillStyle = '#222';
+        ctx.fillRect(0, 0, refThumb.width, refThumb.height);
+        ctx.drawImage(img, 0, 0, refThumb.width, refThumb.height);
+      }
+    } catch { /* ignore */ }
+  }
+  state.hasRef = true;
+  refCard.hidden = false;
+  updateUi();
+  return true;
+}
+
 function resetVision(clearRef = false) {
   vision.reset(!!state.still, clearRef);
   lastSig = null;
@@ -496,9 +554,10 @@ async function startCamera() {
     state.source = 'camera';
     state.demoTruth = null;
     frame.classList.remove('show');
-    resetVision(true);
+    resetVision(false);
     if (!batterySaver) startMl();
     await camera.start('environment');
+    await ensureScanInEngine();
     video.classList.toggle('mirror', camera.isFront());
     syncTorch();
     setFrozen(false);
@@ -521,10 +580,11 @@ function useStill(canvas, source, truth = null) {
   state.frozen = false;
   frame.classList.add('show');
   gate.classList.add('hidden');
-  resetVision(true);
+  resetVision(false);
   measure();
   updateUi();
   reprocessStill();
+  ensureScanInEngine();
 }
 
 function loadDemo() {
@@ -685,6 +745,7 @@ function requestRefEmbed(res, lay) {
     const img = workSnapshot(state.resultLayout || lay);
     if (!img || !box) return;
     const out = await ml.embedRef(img.data, img.width, img.height, { box });
+    if (out?.ok && out.embedding) persistScan({ embedding: out.embedding });
     if (out?.ok && state.result) maybeScore(state.result);
   });
 }
@@ -720,6 +781,7 @@ async function doScan() {
 function clearRef() {
   vision.clearRef();
   ml.clearRef();
+  forgetScan();
   state.hasRef = false;
   state.mlResult = null;
   refCard.hidden = true;
@@ -887,6 +949,7 @@ function bind() {
       if (state.source === 'camera' && !state.frozen) {
         video.play().catch(() => {});
       }
+      ensureScanInEngine();
     }
   });
   window.addEventListener('resize', measure);
@@ -919,6 +982,7 @@ function exposeDebug() {
         perf: perfSummary(),
         ml: { ...ml.getState(), result: state.mlResult },
         displayed: r ? displayLists(r) : null,
+        savedScan: !!readSavedScan(),
         colorQuery: state.colorQuery,
         colorHits: r ? (r.colorHits || []).length : 0,
         batterySaver,
@@ -951,4 +1015,5 @@ exposeDebug();
 measure();
 requestAnimationFrame(loop);
 updateUi();
+if (readSavedScan()) ensureScanInEngine();
 if (new URLSearchParams(location.search).has('demo')) loadDemo();

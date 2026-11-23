@@ -89,6 +89,8 @@ export function createVision(onResult) {
       return ensureInline().then((eng) => {
         if (msg.type === 'allPairs') return eng.allPairs(msg.strictness);
         if (msg.type === 'setRefMask') return eng.setRefFromMask(msg.mask ? new Uint8Array(msg.mask) : null, msg.excludeId);
+        if (msg.type === 'setAppearance') return eng.setAppearance(msg.desc, msg.excludeId);
+        if (msg.type === 'getAppearance') return eng.getAppearance();
         return eng.simBetween(msg.a, msg.b);
       });
     }
@@ -105,6 +107,8 @@ export function createVision(onResult) {
     reset: (hard = false, clearRef = false) => post({ type: 'reset', hard, clearRef }),
     clearRef: () => post({ type: 'clearRef' }),
     setRefMask: (mask, excludeId) => ask({ type: 'setRefMask', mask, excludeId }),
+    setAppearance: (desc, excludeId) => ask({ type: 'setAppearance', desc, excludeId }),
+    getAppearance: () => ask({ type: 'getAppearance' }),
     allPairs: (strictness) => ask({ type: 'allPairs', strictness }),
     sim: (a, b) => ask({ type: 'sim', a, b }),
     isBusy: () => busy,

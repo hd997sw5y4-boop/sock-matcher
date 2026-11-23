@@ -12,7 +12,8 @@
     "test:embed": "node tests/embed-regress.mjs",
     "fetch-models": "node scripts/fetch-models.mjs",
     "test:ios": "npx playwright test tests/ios-safari.spec.js --browser=webkit",
-    "test:colors": "node tests/color-sort.mjs"
+    "test:colors": "node tests/color-sort.mjs",
+    "test:appearance": "node tests/appearance-scan.mjs"
   },
   "devDependencies": {
     "@huggingface/transformers": "^4.3.2",

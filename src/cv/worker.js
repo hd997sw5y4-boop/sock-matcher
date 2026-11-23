@@ -26,6 +26,11 @@ self.onmessage = (e) => {
       const mask = m.mask ? new Uint8Array(m.mask) : null;
       const value = engine.setRefFromMask(mask, m.excludeId);
       self.postMessage({ type: 'reply', id: m.id, value });
+    } else if (m.type === 'setAppearance') {
+      const value = engine.setAppearance(m.desc, m.excludeId);
+      self.postMessage({ type: 'reply', id: m.id, value });
+    } else if (m.type === 'getAppearance') {
+      self.postMessage({ type: 'reply', id: m.id, value: engine.getAppearance() });
     }
   } catch (err) {
     self.postMessage({ type: 'error', message: String(err && err.stack || err), seq: m.seq });
