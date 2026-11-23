@@ -35,8 +35,8 @@ export function createSegmenter() {
     bgB = new Float32Array(n);
   }
 
-  /** Dominant surface chroma (peak of a smoothed a*b* histogram). */
-  function surfaceChroma(A, B, L) {
+  /** Fill the smoothed a*b* histogram. Returns nothing; reads Ls/As/Bs-style arrays. */
+  function fillAbHist(A, B, L) {
     abHist.fill(0);
     for (let i = 0; i < n; i += 2) {
       if (L[i] < 18) continue; // ignore very dark gaps
@@ -45,7 +45,6 @@ export function createSegmenter() {
       if (ai < 0 || bi < 0 || ai >= AB_N || bi >= AB_N) continue;
       abHist[ai * AB_N + bi] += 1;
     }
-    let best = -1, bi0 = AB_N / 2, bj0 = AB_N / 2;
     for (let i = 1; i < AB_N - 1; i++) {
       for (let j = 1; j < AB_N - 1; j++) {
         let s = 0;
@@ -55,10 +54,77 @@ export function createSegmenter() {
         }
         s += abHist[i * AB_N + j] * 2;
         abSmooth[i * AB_N + j] = s;
+      }
+    }
+  }
+
+  function binToChroma(i, j) {
+    return [i * AB_BIN - AB_RANGE + AB_BIN / 2, j * AB_BIN - AB_RANGE + AB_BIN / 2];
+  }
+
+  /** Dominant surface chroma (peak of a smoothed a*b* histogram). */
+  function surfaceChroma(A, B, L) {
+    fillAbHist(A, B, L);
+    let best = -1, bi0 = AB_N / 2, bj0 = AB_N / 2;
+    for (let i = 1; i < AB_N - 1; i++) {
+      for (let j = 1; j < AB_N - 1; j++) {
+        const s = abSmooth[i * AB_N + j];
         if (s > best) { best = s; bi0 = i; bj0 = j; }
       }
     }
-    return [bi0 * AB_BIN - AB_RANGE + AB_BIN / 2, bj0 * AB_BIN - AB_RANGE + AB_BIN / 2];
+    return binToChroma(bi0, bj0);
+  }
+
+  /** Top local-maxima chroma modes, well separated in a*b*. First entry is the global peak. */
+  function chromaPeaks(A, B, L, k = 3) {
+    fillAbHist(A, B, L);
+    const peaks = [];
+    for (let i = 1; i < AB_N - 1; i++) {
+      for (let j = 1; j < AB_N - 1; j++) {
+        const s = abSmooth[i * AB_N + j];
+        if (s <= 0) continue;
+        let isMax = true;
+        for (let di = -1; di <= 1 && isMax; di++) {
+          for (let dj = -1; dj <= 1; dj++) {
+            if (!di && !dj) continue;
+            if (abSmooth[(i + di) * AB_N + (j + dj)] > s) { isMax = false; break; }
+          }
+        }
+        if (isMax) peaks.push({ i, j, s });
+      }
+    }
+    peaks.sort((a, b) => b.s - a.s);
+    const picked = [];
+    for (const p of peaks) {
+      if (picked.some((q) => Math.abs(q.i - p.i) + Math.abs(q.j - p.j) < 4)) continue;
+      picked.push(p);
+      if (picked.length >= k) break;
+    }
+    if (!picked.length) return [surfaceChroma(A, B, L)];
+    return picked.map((p) => binToChroma(p.i, p.j));
+  }
+
+  /** Cheap quality of a surface guess: more mid-sized components, no giant blob. */
+  function surfaceScore(Ls, As, Bs, sa, sb, override, sens) {
+    const surface = surfaceModel(Ls, As, Bs, sa, sb, override);
+    foreground(Ls, As, Bs, sens);
+    cleanup();
+    const comps = components();
+    const minArea = Math.max(30, n * 0.0016);
+    const midMax = n * 0.15;
+    let mid = 0, largest = 0, fgN = 0;
+    for (let i = 0; i < n; i++) if (fg[i]) fgN++;
+    for (const c of comps) {
+      if (c.area > largest) largest = c.area;
+      if (c.area >= minArea && c.area <= midMax) mid++;
+    }
+    let s = mid * 2;
+    if (largest > n * 0.40) s -= 24;
+    else if (largest > n * 0.25) s -= 8;
+    const frac = fgN / n;
+    if (frac > 0.88) s -= 6;
+    if (frac < 0.12) s -= 6;
+    return { score: s, mid, largest, fgFrac: frac, comps, surface };
   }
 
   /**
@@ -230,7 +296,11 @@ export function createSegmenter() {
     const compId = label[order[start]];
     for (let k = 0; k < area; k++) sub[order[start + k]] = -1;
     const regions = [];
-    const te2 = 8 * 8, tr2 = 14 * 14;
+    // Huge merged piles (socks glued through a mis-labelled floor) need a
+    // tighter color gate so neighbouring prints come apart.
+    const huge = area > n * 0.20;
+    const te = huge ? 6.0 : 8, tr = huge ? 10 : 14;
+    const te2 = te * te, tr2 = tr * tr;
     for (let k = 0; k < area; k++) {
       const s = order[start + k];
       if (sub[s] >= 0) continue;
@@ -370,22 +440,48 @@ export function createSegmenter() {
     ensure(W, H);
     const { L, A, B, Ls, As, Bs } = planes;
     const sens = opts.sensitivity ?? 0.5;
-    let sa, sb;
-    if (opts.surface) { sa = opts.surface.a; sb = opts.surface.b; } else [sa, sb] = surfaceChroma(As, Bs, Ls);
-    const surface = surfaceModel(Ls, As, Bs, sa, sb, opts.surface);
-    foreground(Ls, As, Bs, sens);
-    cleanup();
-    const comps = components();
+    let sa, sb, surface, comps;
+    if (opts.surface) {
+      sa = opts.surface.a; sb = opts.surface.b;
+      surface = surfaceModel(Ls, As, Bs, sa, sb, opts.surface);
+      foreground(Ls, As, Bs, sens);
+      cleanup();
+      comps = components();
+    } else {
+      // If the pile dominates the frame, the global chroma peak is often the
+      // laundry, not the floor. Socks then merge through the floor into one
+      // giant blob that we have to throw away. When that happens, try the
+      // next chroma modes and keep the one that yields mid-sized components.
+      const peaks = chromaPeaks(As, Bs, Ls, 3);
+      sa = peaks[0][0]; sb = peaks[0][1];
+      let chosen = surfaceScore(Ls, As, Bs, sa, sb, null, sens);
+      if (peaks.length > 1 && (chosen.mid < 8 || chosen.largest > n * 0.40)) {
+        let bestAB = peaks[0];
+        for (let p = 1; p < peaks.length; p++) {
+          const alt = surfaceScore(Ls, As, Bs, peaks[p][0], peaks[p][1], null, sens);
+          if (alt.score > chosen.score) { chosen = alt; bestAB = peaks[p]; }
+        }
+        sa = bestAB[0]; sb = bestAB[1];
+        // Re-apply the winner so fg / surface buffers match chosen.comps.
+        chosen = surfaceScore(Ls, As, Bs, sa, sb, null, sens);
+      }
+      surface = chosen.surface;
+      comps = chosen.comps;
+    }
+
     const minArea = Math.max(30, n * 0.0016);
     const maxArea = n * 0.3;
     const areas = comps.filter((c) => c.area >= minArea).map((c) => c.area).sort((a, b) => a - b);
     const med = areas.length ? areas[areas.length >> 1] : minArea * 4;
-    const splitOver = Math.max(med * 2.2, n * 0.02);
+    // Cap the split trigger so a single dominant pile blob (when it's also
+    // the median component) still gets color-split instead of being kept
+    // whole and then discarded as > maxArea.
+    const splitOver = Math.max(n * 0.02, Math.min(med * 2.2, n * 0.08));
     const regions = [];
     for (const c of comps) {
       if (c.area < minArea) continue;
       if (c.area > splitOver) {
-        const parts = splitComponent(c, Ls, As, Bs, minArea);
+        const parts = splitComponent(c, L, A, B, minArea);
         for (const px of parts) {
           if (px.length > maxArea) continue;
           regions.push(regionFromPixels(px, regions.length));

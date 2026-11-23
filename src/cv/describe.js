@@ -23,6 +23,10 @@ export function describeRegion(r, planes, w, h, regionMap, refL) {
   const pL = new Float32Array(PROF), pA = new Float32Array(PROF), pB = new Float32Array(PROF), pN = new Float32Array(PROF);
   const ca = Math.cos(r.angle), sa = Math.sin(r.angle);
   const half = Math.max(1, r.major * 1.9);
+  const halfV = Math.max(1, (r.minor || r.major * 0.4) * 1.9);
+  const GRID = 3;
+  const gL = new Float32Array(GRID * GRID), gA = new Float32Array(GRID * GRID);
+  const gB = new Float32Array(GRID * GRID), gN = new Float32Array(GRID * GRID);
   // Lightness relative to the surface brightness: survives exposure shifts.
   const lScale = 62 / Math.max(25, refL || 62);
   let edge = 0, interior = 0, mL = 0, mA = 0, mB = 0;
@@ -54,8 +58,15 @@ export function describeRegion(r, planes, w, h, regionMap, refL) {
     lh[Math.max(0, Math.min(L_B - 1, l0 + 1))] += tl;
     // Axis profile.
     const u = ((x - r.cx) * ca + (y - r.cy) * sa) / half; // -1..1 roughly
+    const v = ((x - r.cx) * -sa + (y - r.cy) * ca) / halfV;
     const pi = Math.max(0, Math.min(PROF - 1, ((u + 1) / 2 * PROF) | 0));
     pL[pi] += l; pA[pi] += a; pB[pi] += b; pN[pi]++;
+    if (Math.abs(u) <= 0.75 && Math.abs(v) <= 0.75) {
+      const gi = Math.max(0, Math.min(GRID - 1, ((u + 0.75) / 1.5 * GRID) | 0));
+      const gj = Math.max(0, Math.min(GRID - 1, ((v + 0.75) / 1.5 * GRID) | 0));
+      const g = gi * GRID + gj;
+      gL[g] += l; gA[g] += a; gB[g] += b; gN[g]++;
+    }
     // Texture on the unblurred L.
     const gx = L[i + 1] - L[i - 1], gy = L[i + w] - L[i - w];
     const mag = Math.abs(gx) + Math.abs(gy);
@@ -90,9 +101,15 @@ export function describeRegion(r, planes, w, h, regionMap, refL) {
     if (last && s !== last) stripes++;
     last = s;
   }
+  const meanL = mL / cnt, meanA = mA / cnt, meanB = mB / cnt;
+  const grid = new Float32Array(GRID * GRID * 3);
+  for (let g = 0; g < GRID * GRID; g++) {
+    if (gN[g]) { grid[g * 3] = gL[g] / gN[g]; grid[g * 3 + 1] = gA[g] / gN[g]; grid[g * 3 + 2] = gB[g] / gN[g]; }
+    else { grid[g * 3] = meanL; grid[g * 3 + 1] = meanA; grid[g * 3 + 2] = meanB; }
+  }
   return {
-    ab, lh, ori, bands,
-    mean: [mL / cnt, mA / cnt, mB / cnt],
+    ab, lh, ori, bands, grid,
+    mean: [meanL, meanA, meanB],
     pal: palette(samples, 3),
     edge: edge / cnt,
     stripes,

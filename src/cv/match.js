@@ -48,6 +48,20 @@ function bandDistFold(x, y) {
   return Math.min(aligned, palDist(px, py));
 }
 
+/** Mean Lab distance of a 3x3 axis-aligned print grid, best of 180° flip. */
+function gridDist(x, y) {
+  if (!x || !y || x.length !== y.length) return 0;
+  const n = x.length / 3;
+  const fwd = [], rot = [];
+  for (let i = 0; i < n; i++) {
+    const j = n - 1 - i;
+    fwd.push(cdist(x[i * 3], x[i * 3 + 1], x[i * 3 + 2], y[i * 3], y[i * 3 + 1], y[i * 3 + 2]));
+    rot.push(cdist(x[i * 3], x[i * 3 + 1], x[i * 3 + 2], y[j * 3], y[j * 3 + 1], y[j * 3 + 2]));
+  }
+  const med = (arr) => { const a = arr.slice().sort((p, q) => p - q); return a[a.length >> 1]; };
+  return Math.min(med(fwd), med(rot));
+}
+
 /**
  * Scan-mode score: appearance only. Color histograms, palette, stripe/pattern
  * texture. No size, area, aspect, length, or shape/contour terms — a bunched
@@ -64,13 +78,16 @@ export function appearanceSimilarity(a, b) {
   const sEdge = Math.exp(-Math.abs((a.edge || 0) - (b.edge || 0)) / 0.09);
   const sStripe = Math.exp(-Math.abs((a.stripes || 0) - (b.stripes || 0)) / 3);
   const tex = 0.4 * sEdge + 0.35 * sOri + 0.25 * sStripe;
+  // Missing grid (older saved scans) must not change the score.
+  const sGrid = (a.grid && b.grid) ? Math.exp(-gridDist(a.grid, b.grid) / 14) : 1;
   return Math.exp(
-    0.26 * Math.log(sAB + 1e-4)
-    + 0.20 * Math.log(sPal + 1e-4)
-    + 0.16 * Math.log(sMean + 1e-4)
+    0.20 * Math.log(sAB + 1e-4)
+    + 0.16 * Math.log(sPal + 1e-4)
+    + 0.12 * Math.log(sMean + 1e-4)
     + 0.12 * Math.log(sBand + 1e-4)
-    + 0.06 * Math.log(sL + 1e-4)
-    + 0.20 * Math.log(tex + 1e-4),
+    + 0.04 * Math.log(sL + 1e-4)
+    + 0.18 * Math.log(tex + 1e-4)
+    + 0.18 * Math.log(sGrid + 1e-4),
   );
 }
 
@@ -105,7 +122,7 @@ export function similarity(a, b) {
 export function appearanceOf(d) {
   if (!d) return null;
   return {
-    ab: d.ab, lh: d.lh, ori: d.ori, bands: d.bands,
+    ab: d.ab, lh: d.lh, ori: d.ori, bands: d.bands, grid: d.grid,
     mean: d.mean, pal: d.pal, edge: d.edge, stripes: d.stripes,
   };
 }
@@ -115,7 +132,7 @@ export function serializeAppearance(d) {
   if (!a) return null;
   const arr = (v) => (v && typeof v.length === 'number' ? Array.from(v) : v);
   return {
-    ab: arr(a.ab), lh: arr(a.lh), ori: arr(a.ori), bands: arr(a.bands),
+    ab: arr(a.ab), lh: arr(a.lh), ori: arr(a.ori), bands: arr(a.bands), grid: arr(a.grid),
     mean: arr(a.mean), pal: a.pal, edge: a.edge, stripes: a.stripes,
   };
 }
@@ -124,7 +141,7 @@ export function parseAppearance(raw) {
   if (!raw) return null;
   const f32 = (v) => (v ? new Float32Array(v) : v);
   return {
-    ab: f32(raw.ab), lh: f32(raw.lh), ori: f32(raw.ori), bands: f32(raw.bands),
+    ab: f32(raw.ab), lh: f32(raw.lh), ori: f32(raw.ori), bands: f32(raw.bands), grid: f32(raw.grid),
     mean: raw.mean ? Array.from(raw.mean) : raw.mean,
     pal: raw.pal, edge: raw.edge, stripes: raw.stripes,
   };

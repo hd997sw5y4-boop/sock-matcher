@@ -360,10 +360,18 @@ export function createEngine() {
     const x1 = Math.min(W - 1, Math.ceil(b.x1)), y1 = Math.min(H - 1, Math.ceil(b.y1));
     const boxArea = (x1 - x0 + 1) * (y1 - y0 + 1);
     // 1) A detected sock mostly inside the target.
-    let best = null, bestScore = 0;
+    let best = null, bestScore = -1e9;
+    const mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+    const boxRad = Math.max(8, Math.hypot(x1 - x0, y1 - y0) / 2);
     for (const r of s.regions) {
       if (r.cx < x0 || r.cx > x1 || r.cy < y0 || r.cy > y1) continue;
-      const score = r.area * (1 - 0.5 * Math.hypot(r.cx - (x0 + x1) / 2, r.cy - (y0 + y1) / 2) / Math.hypot(x1 - x0, y1 - y0));
+      const ix0 = Math.max(r.minX, x0), iy0 = Math.max(r.minY, y0);
+      const ix1 = Math.min(r.maxX, x1), iy1 = Math.min(r.maxY, y1);
+      const inter = Math.max(0, ix1 - ix0) * Math.max(0, iy1 - iy0);
+      const overlap = inter / Math.max(1, r.area);
+      // Prefer the sock the box is aimed at, not merely the largest one that
+      // happens to overlap a crowded scan box.
+      const score = overlap * 2 - Math.hypot(r.cx - mx, r.cy - my) / boxRad;
       if (score > bestScore) { bestScore = score; best = r; }
     }
     if (best && best.area > boxArea * 0.08) {

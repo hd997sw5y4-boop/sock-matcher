@@ -233,6 +233,42 @@ function regionIsMulti(r, planes, w) {
  * Find every sock-like blob matching `query`.
  * query = { id } or { id: 'pick', L, a, b }
  */
+/**
+ * Patterned rugs and wood grain have high, poorly-oriented chroma jitter.
+ * Striped or printed socks have contrast too, but along a dominant direction
+ * or in compact blobs. Used to keep Colors mode from outlining the floor.
+ */
+function isMottledSurface(hit, planes, w) {
+  const { Ls, As, Bs } = planes;
+  const box = hit.box;
+  if (!box) return false;
+  const x0 = box[0], y0 = box[1], x1 = box[2], y1 = box[3];
+  const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+  if (bw < 8 || bh < 8) return false;
+  const stepX = Math.max(1, Math.floor(bw / 8));
+  const stepY = Math.max(1, Math.floor(bh / 8));
+  let n = 0, jitter = 0, gxx = 0, gyy = 0, gxy = 0;
+  for (let y = y0 + 1; y < y1; y += stepY) {
+    for (let x = x0 + 1; x < x1; x += stepX) {
+      const i = y * w + x;
+      const da1 = As[i] - As[i - 1], db1 = Bs[i] - Bs[i - 1];
+      const da2 = As[i] - As[i - w], db2 = Bs[i] - Bs[i - w];
+      const gx = da1 + db1, gy = da2 + db2;
+      jitter += Math.abs(da1) + Math.abs(db1) + Math.abs(da2) + Math.abs(db2);
+      gxx += gx * gx; gyy += gy * gy; gxy += gx * gy;
+      n++;
+    }
+  }
+  if (n < 8) return false;
+  const meanJ = jitter / n;
+  const tr = gxx + gyy;
+  const disc = Math.sqrt(Math.max(0, (gxx - gyy) * (gxx - gyy) + 4 * gxy * gxy));
+  const ev1 = 0.5 * (tr + disc), ev2 = 0.5 * (tr - disc);
+  const coher = ev1 / Math.max(1e-3, ev1 + ev2); // 1 = one dominant gradient direction
+  // Rugs: lots of short irregular color changes, no single stripe direction.
+  return meanJ > 7.5 && coher < 0.72 && hit.area > 28;
+}
+
 export function collectColorHits(planes, seg, query, { roi } = {}) {
   const w = seg.w, h = seg.h;
   const n = w * h;
@@ -274,8 +310,10 @@ export function collectColorHits(planes, seg, query, { roi } = {}) {
     }
   }
 
-  return componentsOf(mask, w, h, roi, minArea, maxArea);
+  const hits = componentsOf(mask, w, h, roi, minArea, maxArea);
+  return hits.filter((h) => !isMottledSurface(h, planes, w));
 }
+
 
 export function chipTint(id) {
   return CHIP_BY_ID[id]?.tint || '#64d2ff';
