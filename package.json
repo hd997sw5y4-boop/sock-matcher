@@ -1,0 +1,14 @@
+{
+  "name": "sock-matcher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Live camera sock matcher — classic computer vision, no AI, no server.",
+  "scripts": {
+    "start": "npx --yes serve -l 4173 --no-clipboard .",
+    "test": "npx playwright test",
+    "test:install": "npx playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1"
+  }
+}

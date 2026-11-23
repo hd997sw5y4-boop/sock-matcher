@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#0b0b0d" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Sock Match" />
+  <meta name="description" content="Point your camera at a pile of socks and find the pairs. Works entirely on your phone — no account, no AI, no server." />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/public/icon-192.png" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/public/icon-32.png" />
+  <title>Sock Matcher</title>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="stage">
+      <video id="video" playsinline muted autoplay></video>
+      <canvas id="frame" aria-hidden="true"></canvas>
+      <canvas id="overlay" aria-hidden="true"></canvas>
+    </div>
+
+    <header id="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <span class="title">Sock Matcher</span>
+      </div>
+      <div class="top-actions">
+        <button id="btn-torch" class="icon-btn" type="button" aria-label="Toggle flashlight" hidden>Flash</button>
+        <button id="btn-demo" class="icon-btn" type="button" aria-label="Load demo pile">Demo</button>
+        <button id="btn-upload" class="icon-btn" type="button" aria-label="Upload or take a photo">Photo</button>
+        <button id="btn-settings" class="icon-btn gear" type="button" aria-label="Settings">Settings</button>
+      </div>
+    </header>
+
+    <div id="status-chip" hidden></div>
+
+    <div id="gate">
+      <div class="gate-card">
+        <div class="gate-socks" aria-hidden="true">
+          <i class="s s1"></i><i class="s s2"></i><i class="s s3"></i>
+        </div>
+        <h1>Find the pairs.</h1>
+        <p>Spread your socks on a bed or floor, then point the camera. Matching pairs light up with the same color and number.</p>
+        <p class="tip">Tip: spread them out on a plain surface for best results.</p>
+        <button id="btn-camera" class="primary" type="button">Enable Camera</button>
+        <div class="gate-row">
+          <button id="btn-demo-gate" class="secondary" type="button">Try Demo Pile</button>
+          <button id="btn-upload-gate" class="secondary" type="button">Upload Photo</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" hidden></div>
+
+    <footer id="dock">
+      <button id="btn-freeze" class="shutter" type="button" aria-label="Freeze frame">
+        <span class="shutter-ring"></span>
+        <span class="shutter-label">Freeze</span>
+      </button>
+      <div id="mode-toggle" class="pills" role="tablist" aria-label="Matching mode">
+        <button id="mode-pairs" class="pill active" type="button" role="tab" aria-selected="true">Auto Pairs</button>
+        <button id="mode-tap" class="pill" type="button" role="tab" aria-selected="false">Tap to Match</button>
+      </div>
+    </footer>
+
+    <aside id="sheet" hidden>
+      <div class="sheet-backdrop" id="sheet-backdrop"></div>
+      <div class="sheet-card" role="dialog" aria-label="Settings">
+        <div class="sheet-handle"></div>
+        <h2>Settings</h2>
+        <label class="slider-row">
+          <div class="slider-head">
+            <span>Detection sensitivity</span>
+            <span id="sens-val">50</span>
+          </div>
+          <input id="sens" type="range" min="0" max="100" value="50" />
+          <small>Turn up if socks are missed. Turn down if the bed or floor is detected as a sock.</small>
+        </label>
+        <label class="slider-row">
+          <div class="slider-head">
+            <span>Match strictness</span>
+            <span id="strict-val">55</span>
+          </div>
+          <input id="strict" type="range" min="0" max="100" value="55" />
+          <small>Turn up for look-alike socks. Turn down if real pairs are being skipped.</small>
+        </label>
+        <div class="sheet-actions">
+          <button id="btn-lock-surface" class="secondary" type="button">Set Surface</button>
+          <button id="btn-reset-surface" class="secondary" type="button">Auto Surface</button>
+        </div>
+        <p class="sheet-note" id="surface-note">Surface color is estimated from the edges of the frame.</p>
+        <button id="btn-switch-cam" class="secondary full" type="button">Switch Camera</button>
+        <button id="btn-close-sheet" class="primary full" type="button">Done</button>
+      </div>
+    </aside>
+
+    <input id="file-input" type="file" accept="image/*" hidden />
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
