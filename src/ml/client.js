@@ -1,6 +1,6 @@
 /**
  * Main-thread handle for the pattern-model worker.
- * Lazy-loads on first use, reports download progress, and rates-limits scoring.
+ * Lazy-loads on first use, reports download progress, and scores a few crops on demand.
  */
 import { createScoreTracker, pickMatches, MAX_SHOWN } from './rank.js';
 
@@ -111,18 +111,25 @@ export function createMlClient() {
       tracker.reset();
       return value || { ok: false };
     },
+    async embedRef(rgba, w, h, { mask, box, cx, cy } = {}) {
+      if (!worker) return { ok: false };
+      const buf = copyFrame(rgba);
+      const value = await ask({ type: 'embedRef', buf, w, h, mask, box, cx, cy }, [buf]);
+      tracker.reset();
+      return value || { ok: false };
+    },
     /**
-     * Re-score at most a few times per second. Returns current shown matches
-     * (possibly from the last tick) or null if this tick was skipped.
+     * Re-score at most ~1–2 Hz, and only a few candidate crops — never the
+     * full frame continuously. Returns null if this tick was skipped.
      */
-    async score(rgba, w, h, tracks, { mode = 'scan', minInterval = 350, now = performance.now(), pairColor } = {}) {
+    async score(rgba, w, h, tracks, { mode = 'scan', minInterval = 700, maxCrops = 6, now = performance.now(), pairColor } = {}) {
       if (!this.isReady() || scoring) return null;
       if (now - lastScoreAt < minInterval) return null;
       lastScoreAt = now;
       scoring = true;
       try {
         const buf = copyFrame(rgba);
-        const value = await ask({ type: 'score', buf, w, h, tracks, mode }, [buf]);
+        const value = await ask({ type: 'score', buf, w, h, tracks, mode, maxCrops }, [buf]);
         if (!value || value.skipped) return null;
         if (mode === 'pairs') {
           let pairs = value.pairs || [];

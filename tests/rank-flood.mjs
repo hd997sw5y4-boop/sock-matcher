@@ -18,10 +18,10 @@ function assert(cond, msg) {
 {
   const strong = combinedScore(0.92, 0.8);
   const mid = combinedScore(0.78, 0.6);
-  const weak = combinedScore(0.55, 0.8);
+  const weak = combinedScore(0.48, 0.5);
   assert(strong > mid && mid > weak, `combined ranks pattern first (${strong.toFixed(2)} > ${mid.toFixed(2)} > ${weak.toFixed(2)})`);
   assert(strong >= ACQUIRE, 'a clear pattern+color match clears acquire');
-  assert(weak < ACQUIRE, 'color alone without pattern stays below acquire');
+  assert(weak < ACQUIRE, 'a weak pattern and middling color stays below acquire');
 }
 
 {

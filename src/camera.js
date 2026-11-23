@@ -9,8 +9,9 @@ export function createCamera(video) {
       audio: false,
       video: {
         facingMode: { ideal: preferred },
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
+        width: { ideal: 640 },
+        height: { ideal: 480 },
+        frameRate: { ideal: 30, max: 30 },
       },
     };
     stream = await navigator.mediaDevices.getUserMedia(constraints);

@@ -2,18 +2,21 @@
   "name": "sock-matcher",
   "version": "1.0.0",
   "private": true,
-  "description": "Live camera sock matcher \u2014 on-device pattern model plus classic computer vision, no server.",
+  "description": "Live camera sock matcher — on-device pattern model plus classic computer vision, no server.",
   "scripts": {
     "start": "npx --yes serve -l 4173 --no-clipboard .",
     "test": "npx playwright test",
-    "test:install": "npx playwright install chromium",
+    "test:install": "npx playwright install chromium webkit",
     "test:lock": "node tests/lock-hold.mjs",
     "test:rank": "node tests/rank-flood.mjs",
-    "test:embed": "node tests/embed-regress.mjs"
+    "test:embed": "node tests/embed-regress.mjs",
+    "fetch-models": "node scripts/fetch-models.mjs",
+    "test:ios": "npx playwright test tests/ios-safari.spec.js --browser=webkit"
   },
   "devDependencies": {
     "@huggingface/transformers": "^4.3.2",
-    "@playwright/test": "^1.56.1"
+    "@playwright/test": "^1.56.1",
+    "esbuild": "^0.28.2"
   },
   "type": "module"
 }

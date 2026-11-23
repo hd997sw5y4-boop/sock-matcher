@@ -39,7 +39,7 @@
     <div id="status-chip" hidden></div>
     <div id="model-progress" hidden>
       <div class="mp-bar"><i id="model-progress-bar"></i></div>
-      <span id="model-progress-label">Loading pattern model…</span>
+      <span id="model-progress-label">Loading smart matching… 0%</span>
     </div>
 
     <div id="gate">
@@ -98,6 +98,13 @@
           </div>
           <input id="strict" type="range" min="0" max="100" value="55" />
           <small>Turn up if wrong socks light up. Turn down if real matches are missed.</small>
+        </label>
+        <label class="toggle-row">
+          <div>
+            <span>Battery saver</span>
+            <small>On by default so the phone stays cooler. Classic matching runs at about 8 frames a second; the pattern model only runs after you pick a sock.</small>
+          </div>
+          <input id="battery-saver" type="checkbox" checked />
         </label>
         <div class="sheet-actions">
           <button id="btn-lock-surface" class="secondary" type="button">Set Surface</button>

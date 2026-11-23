@@ -26,9 +26,32 @@ const params = new URLSearchParams(location.search);
 const DEMO_MODE = params.has('demo');
 const USE_ML = !DEMO_MODE && !params.has('noml');
 
-const CAMERA_PIXELS = 90_000; // vision buffer size (about 210x430 on a phone)
+const MAX_VISION_SIDE = 320; // live camera work buffer, long side
 const STILL_PIXELS = 140_000;
-const MIN_INTERVAL = 60; // ms between vision frames (<= ~16 Hz)
+const MIN_INTERVAL_SAVER = 125; // ~8 Hz classic detector
+const MIN_INTERVAL_PERF = 90;   // still conservative if saver is off
+const ML_INTERVAL_SAVER = 700;  // ~1.4 Hz embeddings, a few crops only
+const ML_INTERVAL_PERF = 500;   // ~2 Hz
+const MAX_ML_CROPS = 6;
+const SAVER_KEY = 'sock-matcher-battery-saver';
+
+function readBatterySaver() {
+  try {
+    const v = localStorage.getItem(SAVER_KEY);
+    if (v == null) return true;
+    return v !== '0';
+  } catch { return true; }
+}
+
+let batterySaver = readBatterySaver();
+
+function setBatterySaver(on) {
+  batterySaver = !!on;
+  try { localStorage.setItem(SAVER_KEY, on ? '1' : '0'); } catch { /* ignore */ }
+}
+
+function classicInterval() { return batterySaver ? MIN_INTERVAL_SAVER : MIN_INTERVAL_PERF; }
+function mlInterval() { return batterySaver ? ML_INTERVAL_SAVER : ML_INTERVAL_PERF; }
 
 const state = {
   mode: 'scan',
@@ -99,8 +122,14 @@ function layoutFor(src) {
     const s = Math.max(vw / sw0, vh / sh0);
     const sw = vw / s, sh = vh / s;
     const rect = { sx: (sw0 - sw) / 2, sy: (sh0 - sh) / 2, sw, sh };
-    const ww = Math.max(120, Math.round(Math.sqrt(CAMERA_PIXELS * vw / vh)));
-    const wh = Math.round(ww * vh / vw);
+    let ww, wh;
+    if (vw >= vh) {
+      ww = MAX_VISION_SIDE;
+      wh = Math.max(120, Math.round(MAX_VISION_SIDE * vh / vw));
+    } else {
+      wh = MAX_VISION_SIDE;
+      ww = Math.max(120, Math.round(MAX_VISION_SIDE * vw / vh));
+    }
     const k = vw / ww;
     const mirror = camera.isFront();
     return {
@@ -179,6 +208,49 @@ function submit(now) {
   return true;
 }
 
+function hasPending() {
+  const p = state.pending;
+  return !!(p.scanBox || p.tap || p.surfaceTap || p.surfaceAuto);
+}
+
+function queueVision() {
+  if (state.still) {
+    reprocessStill();
+    return;
+  }
+  state.forceNext = true;
+  if (!vision.isBusy()) {
+    submit(performance.now());
+    state.forceNext = false;
+  }
+}
+
+const sigCanvas = document.createElement('canvas');
+sigCanvas.width = 12;
+sigCanvas.height = 12;
+const sigCtx = sigCanvas.getContext('2d', { willReadFrequently: true });
+let lastSig = null;
+
+function barelyChanged() {
+  if (hasPending()) return false;
+  const src = currentSource();
+  if (!src) return false;
+  try {
+    sigCtx.drawImage(src, 0, 0, 12, 12);
+    const d = sigCtx.getImageData(0, 0, 12, 12).data;
+    if (!lastSig) { lastSig = new Uint8Array(d); return false; }
+    let acc = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      acc += Math.abs(d[i] - lastSig[i]) + Math.abs(d[i + 1] - lastSig[i + 1]) + Math.abs(d[i + 2] - lastSig[i + 2]);
+    }
+    if (acc / 144 < 8) return true;
+    lastSig = new Uint8Array(d);
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function onResult(res) {
   const lay = state.submissions.get(res.seq) || [...state.submissions.values()].pop();
   state.result = res;
@@ -199,14 +271,23 @@ function onResult(res) {
 }
 
 function displayLists(res) {
-  const mlOn = USE_ML && ml.isReady();
+  const mlMatches = state.mlResult?.matches || [];
+  const mlPairs = state.mlResult?.pairs || [];
+  // Classic highlights stay up until the model actually returns confident matches.
   if (state.mode === 'scan') {
-    if (mlOn && state.hasRef) return { matches: state.mlResult?.matches || [], pairs: [] };
-    if (mlOn && !state.hasRef) return { matches: [], pairs: [] };
+    if (mlMatches.length) return { matches: mlMatches, pairs: [] };
     return { matches: res.matches || [], pairs: [] };
   }
-  if (mlOn) return { matches: [], pairs: state.mlResult?.pairs || [] };
+  if (mlPairs.length) return { matches: [], pairs: mlPairs };
   return { matches: [], pairs: res.pairs || [] };
+}
+
+function mlStatusText() {
+  if (!USE_ML) return '';
+  const s = ml.getState();
+  if (s.status === 'loading') return `Loading smart matching… ${Math.max(0, Math.round(s.progress || 0))}%`;
+  if (s.status === 'error') return 'Smart matching unavailable';
+  return '';
 }
 
 function updateTargets(res) {
@@ -271,6 +352,7 @@ function onScanResult(res, lay) {
   refCard.hidden = false;
   if (state.mode !== 'scan') setMode('scan', true);
   toast('Scanned — now point at the pile');
+  requestRefEmbed(res, lay);
 }
 
 function updateUi() {
@@ -282,15 +364,14 @@ function updateUi() {
     else {
       const lists = res ? displayLists(res) : { matches: [] };
       if (lists.matches.length) setChip(`Best match ${Math.round(lists.matches[0].score * 100)}%`);
-      else if (USE_ML && !ml.isReady()) setChip('Loading pattern model…');
-      else setChip('Looking for its match…');
+      else setChip(mlStatusText() || 'Looking for its match…');
     }
   } else {
     shutter.querySelector('.shutter-label').textContent = state.frozen ? 'Resume' : 'Freeze';
     shutter.classList.toggle('on', state.frozen);
     const n = res ? displayLists(res).pairs.length : 0;
-    const waiting = USE_ML && !ml.isReady();
-    setChip(`${state.frozen ? 'Frozen · ' : ''}${n ? `${n} likely pair${n === 1 ? '' : 's'}` : (waiting ? 'Loading pattern model…' : 'Looking for pairs…')}`);
+    const loading = mlStatusText();
+    setChip(`${state.frozen ? 'Frozen · ' : ''}${n ? `${n} likely pair${n === 1 ? '' : 's'}` : (loading || 'Looking for pairs…')}`);
   }
   refCard.hidden = !state.hasRef;
 }
@@ -303,11 +384,21 @@ function targetBox() {
 
 function loop(ts) {
   requestAnimationFrame(loop);
+  if (document.hidden) return;
   const dt = perf.last ? ts - perf.last : 16.7;
   perf.last = ts;
   push(perf.frames, dt, 240);
   const live = state.source === 'camera' && !state.frozen && video.videoWidth;
-  if (live && ts - state.lastSubmit >= MIN_INTERVAL && !vision.isBusy()) submit(ts);
+  const due = state.forceNext || (ts - state.lastSubmit >= classicInterval());
+  if (live && due && !vision.isBusy()) {
+    const must = state.forceNext || hasPending();
+    if (must || !barelyChanged()) {
+      submit(ts);
+      state.forceNext = false;
+    } else {
+      state.lastSubmit = ts;
+    }
+  }
   const showTarget = state.mode === 'scan' && !state.hasRef && state.source && gate.classList.contains('hidden');
   const map = state.resultMap || { scale: 1, mirror: false, toView: (x, y) => [x, y] };
   const ms = overlay.render(ts, Math.min(100, dt), state.view, map, { target: showTarget ? targetBox() : null });
@@ -342,6 +433,7 @@ function perfText() {
 
 function resetVision(clearRef = false) {
   vision.reset(!!state.still, clearRef);
+  lastSig = null;
   overlay.clearAll();
   state.result = null;
   state.mlResult = null;
@@ -360,7 +452,7 @@ async function startCamera() {
     state.demoTruth = null;
     frame.classList.remove('show');
     resetVision(true);
-    startMl();
+    if (!batterySaver) startMl();
     await camera.start('environment');
     video.classList.toggle('mirror', camera.isFront());
     syncTorch();
@@ -375,7 +467,7 @@ async function startCamera() {
 }
 
 function useStill(canvas, source, truth = null) {
-  if (source === 'photo') startMl();
+  if (source === 'photo' && !batterySaver) startMl();
   camera.stop();
   syncTorch();
   state.still = canvas;
@@ -497,24 +589,20 @@ ml.onChange((s) => {
     const bar = $('model-progress-bar');
     const label = $('model-progress-label');
     if (bar) bar.style.width = `${Math.max(2, s.progress || 0)}%`;
-    if (label) label.textContent = (s.progress || 0) < 62 ? 'Loading pattern model…' : 'Loading sock cutter…';
+    if (label) label.textContent = `Loading smart matching… ${Math.max(0, Math.round(s.progress || 0))}%`;
   } else if (s.status === 'ready') {
     el.hidden = true;
-    if (!el.dataset.readyToast) {
-      el.dataset.readyToast = '1';
-      toast('Pattern matching ready — tap a sock');
-    }
     if (state.result) maybeScore(state.result);
     updateUi();
   } else if (s.status === 'error') {
     el.hidden = true;
-    toast('Pattern model couldn’t load — check the network and try again');
+    toast('Smart matching unavailable');
     updateUi();
   }
 });
 
 async function maybeScore(res) {
-  if (!USE_ML || !ml.isReady() || !res) return;
+  if (!USE_ML || !ml.isReady() || !res || document.hidden) return;
   if (state.mode === 'scan' && !state.hasRef) return;
   const lay = state.resultLayout;
   const img = workSnapshot(lay);
@@ -523,11 +611,43 @@ async function maybeScore(res) {
   const out = await ml.score(img.data, img.width, img.height, tracks, {
     mode: state.mode,
     now: performance.now(),
+    minInterval: mlInterval(),
+    maxCrops: MAX_ML_CROPS,
   });
   if (!out) return;
   state.mlResult = out;
   updateTargets(state.result);
   updateUi();
+}
+
+function requestRefEmbed(res, lay) {
+  if (!USE_ML || !res?.scan?.ok) return;
+  startMl();
+  const box = res.scan.box
+    ? { x0: res.scan.box[0], y0: res.scan.box[1], x1: res.scan.box[2], y1: res.scan.box[3] }
+    : null;
+  waitMlReady().then(async (ok) => {
+    if (!ok) return;
+    const img = workSnapshot(state.resultLayout || lay);
+    if (!img || !box) return;
+    const out = await ml.embedRef(img.data, img.width, img.height, { box });
+    if (out?.ok && state.result) maybeScore(state.result);
+  });
+}
+
+function waitMlReady(ms = 120_000) {
+  if (ml.isReady()) return Promise.resolve(true);
+  if (ml.getState().status === 'error') return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const t = setTimeout(() => { un(); resolve(ml.isReady()); }, ms);
+    const un = ml.onChange((s) => {
+      if (s.status === 'ready' || s.status === 'error') {
+        clearTimeout(t);
+        un();
+        resolve(s.status === 'ready');
+      }
+    });
+  });
 }
 
 async function doScan() {
@@ -538,20 +658,9 @@ async function doScan() {
   const [x1, y1] = lay.map.toWork(b.x + b.w, b.y + b.h);
   const box = { x0: Math.min(x0, x1), y0, x1: Math.max(x0, x1), y1 };
   if (state.frozen) setFrozen(false);
-  if (USE_ML && ml.isReady()) {
-    const img = workSnapshot(lay);
-    if (img) {
-      toast('Picking the sock…');
-      const pick = await ml.pick(img.data, img.width, img.height, { x: (box.x0 + box.x1) / 2, y: (box.y0 + box.y1) / 2 }, box);
-      if (await applyPick(pick, lay)) return;
-      toast('Couldn’t find a sock there — try tapping it');
-      return;
-    }
-  } else if (USE_ML && !ml.isReady()) {
-    toast('Still loading the pattern model…');
-  }
+  // Classic scan always runs immediately. The model only embeds afterwards.
   state.pending.scanBox = box;
-  reprocessStill();
+  queueVision();
 }
 
 function clearRef() {
@@ -580,18 +689,8 @@ function onTap(ev) {
     reprocessStill();
     return;
   }
-  if (USE_ML && ml.isReady()) {
-    const img = workSnapshot(lay);
-    if (img) {
-      toast('Picking the sock…');
-      ml.pick(img.data, img.width, img.height, { x: wx, y: wy }).then(async (pick) => {
-        if (!(await applyPick(pick, lay))) toast('Couldn’t find a sock there — try again');
-      });
-      return;
-    }
-  }
   state.pending.tap = { x: wx, y: wy };
-  reprocessStill();
+  queueVision();
 }
 
 function syncTorch() {
@@ -625,6 +724,11 @@ function bind() {
     syncTorch();
   });
 
+  const saverEl = $('battery-saver');
+  if (saverEl) {
+    saverEl.checked = batterySaver;
+    saverEl.addEventListener('change', () => setBatterySaver(saverEl.checked));
+  }
   $('btn-settings').addEventListener('click', () => { $('sheet').hidden = false; });
   $('sheet-backdrop').addEventListener('click', () => { $('sheet').hidden = true; });
   $('btn-close-sheet').addEventListener('click', () => { $('sheet').hidden = true; });
@@ -662,7 +766,17 @@ function bind() {
 
   overlayCanvas.addEventListener('pointerdown', onTap);
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && state.source === 'camera' && state.torch) camera.setTorch(false);
+    if (document.hidden) {
+      if (state.source === 'camera' && state.torch) camera.setTorch(false);
+      if (state.source === 'camera') {
+        try { video.pause(); } catch { /* ignore */ }
+      }
+    } else {
+      lastSig = null;
+      if (state.source === 'camera' && !state.frozen) {
+        video.play().catch(() => {});
+      }
+    }
   });
   window.addEventListener('resize', measure);
   window.addEventListener('orientationchange', () => setTimeout(measure, 250));
@@ -694,6 +808,13 @@ function exposeDebug() {
         perf: perfSummary(),
         ml: { ...ml.getState(), result: state.mlResult },
         displayed: r ? displayLists(r) : null,
+        batterySaver,
+        power: {
+          maxSide: MAX_VISION_SIDE,
+          classicHz: 1000 / classicInterval(),
+          mlInterval: mlInterval(),
+          maxCrops: MAX_ML_CROPS,
+        },
       };
     },
     loadDemo,

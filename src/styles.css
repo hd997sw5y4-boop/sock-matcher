@@ -525,3 +525,28 @@ input[type="range"] {
   pointer-events: none;
 }
 #perf-hud[hidden] { display: none; }
+
+.toggle-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 14px 0 4px;
+  font-size: 15px;
+}
+.toggle-row span { display: block; font-weight: 600; }
+.toggle-row small {
+  display: block;
+  margin-top: 4px;
+  color: #8a8580;
+  font-size: 12px;
+  line-height: 1.35;
+  font-weight: 400;
+}
+.toggle-row input[type="checkbox"] {
+  width: 22px;
+  height: 22px;
+  margin-top: 2px;
+  flex: none;
+  accent-color: #2f6fed;
+}

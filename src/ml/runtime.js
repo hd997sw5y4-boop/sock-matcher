@@ -8,16 +8,32 @@ import { floodFromPoint, maskedCrop, boxCrop, maskToRegion, outlineToRegion } fr
 import { cosine, l2norm, combinedScore, pickMatches } from './rank.js';
 
 export const DINO_ID = 'Xenova/dinov2-small';
-export const SAM_ID = 'Xenova/slimsam-77-uniform';
+export const DTYPE = 'q4'; // ~15 MB, suitable for iPhone Safari
 
-export function configureEnv(env, { cacheDir } = {}) {
-  env.allowRemoteModels = true;
+export function isIOS() {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  return /iP(hone|ad|od)/.test(ua) || (navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1);
+}
+
+export function configureEnv(env, { cacheDir, localModelPath } = {}) {
   if (cacheDir) {
     env.cacheDir = cacheDir;
     env.useFSCache = true;
   }
-  // Browser Cache API / WASM cache keep their library defaults
-  // (on in the browser, off or FS-based in Node).
+  if (typeof navigator !== 'undefined') {
+    env.allowLocalModels = true;
+    env.allowRemoteModels = true;
+    env.localModelPath = localModelPath || '/models/';
+    const wasm = env.backends?.onnx?.wasm;
+    if (wasm) {
+      // Same-origin WASM, one thread, no proxy. Never start a WebGPU backend
+      // alongside WASM — that is a heat and memory problem on phones.
+      wasm.proxy = false;
+      wasm.numThreads = 1;
+      wasm.wasmPaths = '/vendor/onnx/';
+    }
+  }
 }
 
 function onProgress(cb, phase, base, span) {
@@ -32,37 +48,13 @@ function onProgress(cb, phase, base, span) {
   };
 }
 
-async function loadWithDevice(factory) {
-  try {
-    return await factory('webgpu');
-  } catch {
-    return await factory('wasm');
-  }
-}
-
+/** WASM only. Do not attempt WebGPU — and never run both backends. */
 export async function loadExtractor(tf, { progress } = {}) {
-  const extractor = await loadWithDevice((device) => tf.pipeline(
+  return tf.pipeline(
     'image-feature-extraction',
     DINO_ID,
-    { dtype: 'q8', device, progress_callback: onProgress(progress, 'dino', 0, 0.62) },
-  ));
-  return extractor;
-}
-
-export async function loadSam(tf, { progress } = {}) {
-  const opts = (device) => ({
-    dtype: 'q8',
-    device,
-    progress_callback: onProgress(progress, 'sam', 0.62, 0.38),
-  });
-  try {
-    const model = await loadWithDevice((device) => tf.SamModel.from_pretrained(SAM_ID, opts(device)));
-    const processor = await tf.AutoProcessor.from_pretrained(SAM_ID);
-    return { model, processor };
-  } catch (err) {
-    console.warn('SlimSAM failed to load, using flood-fill fallback', err);
-    return null;
-  }
+    { dtype: DTYPE, device: 'wasm', progress_callback: onProgress(progress, 'dino', 0, 1) },
+  );
 }
 
 export function rgbaToRaw(tf, rgba, w, h) {
@@ -246,13 +238,20 @@ export async function pickSock(tf, { extractor, sam }, rgba, w, h, point, box) {
  * Score live proposals against a reference embedding.
  * `cache` is a Map of `${id}:${dv}` -> Float32Array.
  */
-export async function scoreTracks(tf, extractor, rgba, w, h, tracks, refEmb, cache, { mode = 'scan' } = {}) {
+export const MAX_EMBED_CROPS = 6;
+
+export async function scoreTracks(tf, extractor, rgba, w, h, tracks, refEmb, cache, { mode = 'scan', maxCrops = MAX_EMBED_CROPS } = {}) {
   const results = [];
-  for (const t of tracks) {
-    if (!t.box) continue;
+  const ranked = (tracks || []).filter((t) => t && t.box)
+    .slice()
+    .sort((a, b) => (b.colorScore ?? 0) - (a.colorScore ?? 0));
+  let newEmbeds = 0;
+  for (const t of ranked) {
     const key = `${t.id}:${t.dv ?? 0}`;
     let emb = cache.get(key);
     if (!emb && extractor) {
+      if (newEmbeds >= maxCrops) continue;
+      newEmbeds++;
       const region = (t.outline && t.cx != null)
         ? outlineToRegion(t.outline, t.cx, t.cy, w, h)
         : null;
